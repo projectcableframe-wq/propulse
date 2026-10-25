@@ -36,3 +36,8 @@ htmlcov/
 # Temp files
 tmp/
 temp/
+
+# Audit artefacts that are generated on every run
+audit/build/
+audit/__pycache__/
+tests/node_modules/
