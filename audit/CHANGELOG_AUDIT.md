@@ -51,8 +51,12 @@ audit/js/dump_dom.cjs          headless whole-application dump (jsdom)
 tests/run_suite.js             external 126-case conformance suite (jsdom)
 tests/TEST_RESULTS.md          its result table (generated)
 tests/README.md                how to run it and what it does not prove
-patches/patch1..5.py           every patch applied to the HTML, replayable and
-                               asserted (each replacement checks its match count)
+patches/patch1..5.py           every patch applied to the HTML, each replacement
+                               asserted on its match count. patch1-3 were applied to
+                               the original upload; patch4-5 apply to the audited
+                               build in this repository. They are a record of what
+                               changed, not a build script - the shipped file is
+                               already patched.
 legacy/work_v2_original.html   the untouched upload
 legacy/SHA256SUMS              its hash
 ```
