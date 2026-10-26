@@ -10,6 +10,7 @@ const path = require('path');
 
 function findJsdom() {
   const cands = [path.join(__dirname, 'node_modules', 'jsdom'),
+                 path.join(__dirname, '..', '..', 'tests', 'node_modules', 'jsdom'),
                  path.join(__dirname, '..', '..', '..', 'audit_work', 'node_modules', 'jsdom'),
                  '/home/user/audit_work/node_modules/jsdom'];
   for (const c of cands) { if (fs.existsSync(c)) return require(c); }

@@ -1,6 +1,6 @@
 # Audit test report — YANMAR / PROPULSE selection sheet
 
-Generated 2026-10-25 by `audit/run_audit_tests.py`.
+Generated 2026-10-26 by `audit/run_audit_tests.py`.
 
 **443 cases, 443 pass, 0 fail.**
 
