@@ -18,10 +18,10 @@ that proves it?*
 | `3 Propulsion` | Wake fraction, thrust deduction, relative rotative efficiency, hull efficiency, thrust, speed of advance, power balance, reasonableness bands |
 | `4 Propeller` | Thrust identity solved by bisection for 31 shaft speeds (every step shown), Keller blade area, the converged pitch ratio at the selected engine speed, 9 design checks, 2 charts |
 | `5 Engines` | The whole YANMAR commercial range, derated to the site, matched to the propeller at each catalogued gear ratio and ranked |
-| `7 Yanmar data` | Catalogue figures as published, with derived kW/litre, kW/kg and site-corrected output |
-| `8 B-series` | The 39 KT and 47 KQ polynomial coefficients, validity limits, open-water curves |
-| `9 Equations` | Register of every equation used, with the sheet where it is evaluated |
-| `10 Verification` | Every formula of sheets 2–4 typed again from scratch for two reference vessels and compared, cell by cell, with an independent Python implementation |
+| `6 Yanmar data` | Catalogue figures as published, with derived kW/litre, kW/kg and site-corrected output |
+| `7 B-series` | The 39 KT and 47 KQ polynomial coefficients, validity limits, open-water curves |
+| `8 Equations` | Register of every equation used, with the sheet where it is evaluated |
+| `9 Verification` | Every formula of sheets 2–4 typed again from scratch for two reference vessels and compared, cell by cell, with an independent Python implementation |
 
 ## Method and sources
 
@@ -49,7 +49,7 @@ that proves it?*
 
 ## Verification
 
-Sheet `10 Verification` recomputes, from first principles, the resistance, the interaction
+Sheet `9 Verification` recomputes, from first principles, the resistance, the interaction
 coefficients and the propeller solution for a 30 m passenger dhoni and a 48 m passenger ferry,
 and compares every result with `verify_ref.py`, an independent Python implementation of the same
 method. **104 comparisons, all inside 1 × 10⁻⁶ relative difference.**

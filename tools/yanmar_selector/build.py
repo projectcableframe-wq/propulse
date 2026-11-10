@@ -54,10 +54,10 @@ TAB_COLOURS = {
     "3 Propulsion": "00787A",
     "4 Propeller": "00787A",
     "5 Engines": "00787A",
-    "7 Yanmar data": "5B6B7B",
-    "8 B-series": "5B6B7B",
-    "9 Equations": "5B6B7B",
-    "10 Verification": "1E6B33",
+    "6 Yanmar data": "5B6B7B",
+    "7 B-series": "5B6B7B",
+    "8 Equations": "5B6B7B",
+    "9 Verification": "1E6B33",
 }
 
 
@@ -111,7 +111,7 @@ def polish(wb):
         ws.oddFooter.right.size = 8
         if ws.max_row > 40:
             ws.print_title_rows = "1:3"
-        if ws.title not in ("0 Summary", "10 Verification"):
+        if ws.title not in ("0 Summary", "9 Verification"):
             ws.sheet_view.zoomScale = 90
 
 
@@ -134,14 +134,15 @@ def main(path):
         ("3 Propulsion", s_prop),
         ("4 Propeller", s_propeller),
         ("5 Engines", s_engines),
-        ("7 Yanmar data", s_dbyanmar),
-        ("8 B-series", s_dbb),
-        ("9 Equations", s_eq),
-        ("10 Verification", s_verify),
+        ("6 Yanmar data", s_dbyanmar),
+        ("7 B-series", s_dbb),
+        ("8 Equations", s_eq),
+        ("9 Verification", s_verify),
     ]
     for sheet_name, mod in builders:
         nm.sheet = sheet_name
         mod.build(wb, nm)
+    s_eq.fill_names(wb)  # section B of sheet 8 lists the names of every sheet, so it runs last
 
     wb.calculation.fullCalcOnLoad = True
     polish(wb)

@@ -171,7 +171,6 @@ def build(wb, nm):
     nm.add("SW_VS", f"'2 Resistance'!$B${first}:$B${last}")
     nm.add("SW_RT", f"'2 Resistance'!$O${first}:$O${last}")
     nm.add("SW_PE", f"'2 Resistance'!$P${first}:$P${last}")
-    nm.add("SW_PD", f"'2 Resistance'!$P${first}:$P${last}")
 
     ch = LineChart(); ch.title = "Total resistance vs speed"; ch.style = 2
     ch.y_axis.title = "RT  [N]"; ch.x_axis.title = "VS  [kn]"; ch.height = 8.5; ch.width = 16

@@ -1,4 +1,4 @@
-"""Sheet 10 - verification of the spreadsheet formulas against an independent implementation."""
+"""Sheet 9 - verification of the spreadsheet formulas against an independent implementation."""
 from openpyxl.styles import Font, Alignment
 from openpyxl.formatting.rule import CellIsRule
 from theme import *
@@ -9,10 +9,10 @@ SYM = {"RF": "Rf", "RW": "Rw", "RV": "Rv", "RAPP": "Rapp", "RT": "Rt", "ηO": "e
 
 
 def build(wb, nm):
-    ws = wb.create_sheet("10 Verification")
+    ws = wb.create_sheet("9 Verification")
     ws.sheet_view.showGridLines = False
     widths(ws, {"A": 50, "B": 11, "C": 17, "D": 17, "E": 13, "F": 10, "G": 3})
-    title(ws, "10  VERIFICATION  —  SPREADSHEET FORMULAS AGAINST AN INDEPENDENT IMPLEMENTATION",
+    title(ws, "9  VERIFICATION  —  SPREADSHEET FORMULAS AGAINST AN INDEPENDENT IMPLEMENTATION",
           "Every formula of sheets 2, 3 and 4 is typed again here, from first principles, for two reference vessels. "
           "Column C is the live spreadsheet result and column D the value produced by a separate Python implementation "
           "of the same method. The difference must vanish to machine precision.", ncols=6)
@@ -169,7 +169,7 @@ def build(wb, nm):
         rw = crow("Wake fraction", "w", "–",
                   f"={rc9}*{rcv}*({c['L']}/{c['T']})^0.6459*(0.0661875+1.21756*{rc11}*{rcv}/(1-{rcp1}))"
                   f"+0.24558*SQRT({c['B']}/({c['L']}*(1-{rcp1})))-0.09726/(0.95-{c['Cp']})"
-                  f"+0.11434/(0.95-{c['Cb']})+0.75*{c['Cstern']}*{c['Cp']}+0.002*{c['Cstern']}", "0.00000000")
+                  f"+0.11434/(0.95-{c['Cb']})+0.75*{c['Cstern']}*{rcv}+0.002*{c['Cstern']}", "0.00000000")
         rc10 = crow("c10", "c10", "–",
                     f'=IF({c["L"]}/{c["B"]}>=5.2,{c["B"]}/{c["L"]},'
                     f'0.25-0.003328402/({c["B"]}/{c["L"]}-0.134615385))', "0.00000000")

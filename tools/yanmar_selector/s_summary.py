@@ -1,4 +1,4 @@
-"""Sheet 6 - one-page design summary."""
+"""Sheet 0 - one-page design summary."""
 from openpyxl.styles import Font, Alignment
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from theme import *
@@ -139,7 +139,7 @@ def build(wb, nm):
 
     note(ws, rr, 6, "How to use: change the yellow cells on sheet 1 only. Sheet 2 rebuilds the resistance, sheet 3 the "
                     "hull-propeller interaction, sheet 4 the propeller at every possible shaft speed, sheet 5 the whole "
-                    "Yanmar range and sheet 10 verifies the arithmetic against an independent implementation.",
+                    "Yanmar range and sheet 9 verifies the arithmetic against an independent implementation.",
          size=9, span=2)
     ws.row_dimensions[rr].height = 60
 

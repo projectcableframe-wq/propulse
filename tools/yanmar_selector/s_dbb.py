@@ -1,4 +1,4 @@
-"""Sheet 8 - Wageningen B-series coefficient tables and open-water curves."""
+"""Sheet 7 - Wageningen B-series coefficient tables and open-water curves."""
 from openpyxl.chart import ScatterChart, Reference, Series
 from openpyxl.chart.marker import Marker
 from openpyxl.styles import Font
@@ -7,11 +7,11 @@ import db
 
 
 def build(wb, nm):
-    ws = wb.create_sheet("8 B-series")
+    ws = wb.create_sheet("7 B-series")
     ws.sheet_view.showGridLines = False
     widths(ws, {"A": 14, "B": 10, "C": 10, "D": 10, "E": 10, "F": 6, "G": 14, "H": 10, "I": 10,
                 "J": 10, "K": 10, "L": 10, "M": 12, "N": 12})
-    title(ws, "8  WAGENINGEN B-SERIES  —  POLYNOMIAL COEFFICIENTS AND OPEN-WATER CURVES",
+    title(ws, "7  WAGENINGEN B-SERIES  —  POLYNOMIAL COEFFICIENTS AND OPEN-WATER CURVES",
           "KT = Σ C·J^s·(P/D)^t·(AE/A0)^u·Z^v   and the same sum with the KQ coefficient set. "
           "These are the 39 + 47 coefficients of Oosterveld & van Oossanen (1975) as re-published by Bernitsas, Ray & Kinley (1981).",
           ncols=11)
@@ -25,11 +25,11 @@ def build(wb, nm):
         for j, val in enumerate((C, s, t, u, v)):
             calc(ws, rr, j + 1, val, fmt="0.000000000", size=9)
     k1 = k0 + len(db.KT_COEF) - 1
-    nm.add("KT_C", "'8 B-series'!$A$%d:$A$%d" % (k0, k1))
-    nm.add("KT_S", "'8 B-series'!$B$%d:$B$%d" % (k0, k1))
-    nm.add("KT_T", "'8 B-series'!$C$%d:$C$%d" % (k0, k1))
-    nm.add("KT_U", "'8 B-series'!$D$%d:$D$%d" % (k0, k1))
-    nm.add("KT_V", "'8 B-series'!$E$%d:$E$%d" % (k0, k1))
+    nm.add("KT_C", "'7 B-series'!$A$%d:$A$%d" % (k0, k1))
+    nm.add("KT_S", "'7 B-series'!$B$%d:$B$%d" % (k0, k1))
+    nm.add("KT_T", "'7 B-series'!$C$%d:$C$%d" % (k0, k1))
+    nm.add("KT_U", "'7 B-series'!$D$%d:$D$%d" % (k0, k1))
+    nm.add("KT_V", "'7 B-series'!$E$%d:$E$%d" % (k0, k1))
 
     for cc in range(7, 12):
         ws.cell(row=4, column=cc).fill = fill(TEAL_DK)
@@ -41,11 +41,11 @@ def build(wb, nm):
         for j, val in enumerate((C, s, t, u, v)):
             calc(ws, rr, j + 7, val, fmt="0.000000000", size=9)
     k2 = k0 + len(db.KQ_COEF) - 1
-    nm.add("KQ_C", "'8 B-series'!$G$%d:$G$%d" % (k0, k2))
-    nm.add("KQ_S", "'8 B-series'!$H$%d:$H$%d" % (k0, k2))
-    nm.add("KQ_T", "'8 B-series'!$I$%d:$I$%d" % (k0, k2))
-    nm.add("KQ_U", "'8 B-series'!$J$%d:$J$%d" % (k0, k2))
-    nm.add("KQ_V", "'8 B-series'!$K$%d:$K$%d" % (k0, k2))
+    nm.add("KQ_C", "'7 B-series'!$G$%d:$G$%d" % (k0, k2))
+    nm.add("KQ_S", "'7 B-series'!$H$%d:$H$%d" % (k0, k2))
+    nm.add("KQ_T", "'7 B-series'!$I$%d:$I$%d" % (k0, k2))
+    nm.add("KQ_U", "'7 B-series'!$J$%d:$J$%d" % (k0, k2))
+    nm.add("KQ_V", "'7 B-series'!$K$%d:$K$%d" % (k0, k2))
 
     r = max(k1, k2) + 2
     section(ws, r, "C.  VALIDITY OF THE SERIES  (outside these limits the polynomial is an extrapolation)", ncols=11)
@@ -71,7 +71,7 @@ def build(wb, nm):
     r += 1
     label(ws, r, 1, "Pitch ratio used for the curves")
     calc(ws, r, 2, "=FIN_PD", fmt="0.000", bold=True)
-    nm.add("CURVE_PD", "'8 B-series'!$B$%d" % r)
+    nm.add("CURVE_PD", "'7 B-series'!$B$%d" % r)
     r += 1
     thead(ws, r, [(1, "J"), (2, "KT"), (3, "10·KQ"), (4, "ηO"), (5, "J·(KT)²/KQ")], height=20)
     r += 1

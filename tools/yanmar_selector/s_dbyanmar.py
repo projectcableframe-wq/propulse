@@ -1,15 +1,15 @@
-"""Sheet 7 - the Yanmar catalogue in detail."""
+"""Sheet 6 - the Yanmar catalogue in detail."""
 from theme import *
 from openpyxl.utils import get_column_letter as gcl
 import db
 
 
 def build(wb, nm):
-    ws = wb.create_sheet("7 Yanmar data")
+    ws = wb.create_sheet("6 Yanmar data")
     ws.sheet_view.showGridLines = False
     widths(ws, {"A": 13, "B": 9, "C": 8, "D": 9, "E": 8, "F": 8, "G": 7, "H": 9, "I": 10, "J": 10,
                 "K": 11, "L": 11, "M": 11, "N": 30, "O": 46})
-    title(ws, "7  YANMAR MARINE ENGINE DATA  —  AS PUBLISHED, WITH DERIVED SPECIFIC FIGURES",
+    title(ws, "6  YANMAR MARINE ENGINE DATA  —  AS PUBLISHED, WITH DERIVED SPECIFIC FIGURES",
           "Only YANMAR commercial marine engines are used anywhere in this workbook. Every number below is the "
           "manufacturer's published value; the last columns are derived from them and from the site correction of sheet 1.",
           ncols=15)

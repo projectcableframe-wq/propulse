@@ -67,10 +67,10 @@ def build(wb, nm):
     r_cp1 = row("Afterbody prismatic coefficient", "CP1", "=1.45*CP_-0.315-0.0225*LCB_", "=1.45*CP_-0.315-0.0225*LCB_",
                 "–", "CP1 = 1.45·CP − 0.315 − 0.0225·lcb")
     r_w = row("WAKE FRACTION", "w",
-              f"=IF(ISNUMBER(W_OVR),W_OVR,C{r_c9}*C{r_cv}*(L_WL/T_LOAD)^0.6459*(0.0661875+1.21756*C{r_c11}*C{r_cv}/(1-C{r_cp1}))+0.24558*SQRT(B_MLD/(L_WL*(1-C{r_cp1})))-0.09726/(0.95-CP_)+0.11434/(0.95-CB_)+0.75*CSTERN_*CP_+0.002*CSTERN_)",
-              f"=IF(ISNUMBER(W_OVR),W_OVR,D{r_c9}*D{r_cv}*(L_WL/T_BAL)^0.6459*(0.0661875+1.21756*D{r_c11}*D{r_cv}/(1-D{r_cp1}))+0.24558*SQRT(B_MLD/(L_WL*(1-D{r_cp1})))-0.09726/(0.95-CP_)+0.11434/(0.95-CB_)+0.75*CSTERN_*CP_+0.002*CSTERN_)",
+              f"=IF(ISNUMBER(W_OVR),W_OVR,C{r_c9}*C{r_cv}*(L_WL/T_LOAD)^0.6459*(0.0661875+1.21756*C{r_c11}*C{r_cv}/(1-C{r_cp1}))+0.24558*SQRT(B_MLD/(L_WL*(1-C{r_cp1})))-0.09726/(0.95-CP_)+0.11434/(0.95-CB_)+0.75*CSTERN_*C{r_cv}+0.002*CSTERN_)",
+              f"=IF(ISNUMBER(W_OVR),W_OVR,D{r_c9}*D{r_cv}*(L_WL/T_BAL)^0.6459*(0.0661875+1.21756*D{r_c11}*D{r_cv}/(1-D{r_cp1}))+0.24558*SQRT(B_MLD/(L_WL*(1-D{r_cp1})))-0.09726/(0.95-CP_)+0.11434/(0.95-CB_)+0.75*CSTERN_*D{r_cv}+0.002*CSTERN_)",
               "–",
-              "w = c9·CV·(L/Ta)^0.6459·(0.0661875 + 1.21756·c11·CV/(1−CP1)) + 0.24558√[B/(L(1−CP1))] − 0.09726/(0.95−CP) + 0.11434/(0.95−CB) + 0.75·Cstern·CP + 0.002·Cstern",
+              "w = c9·CV·(L/Ta)^0.6459·(0.0661875 + 1.21756·c11·CV/(1−CP1)) + 0.24558√[B/(L(1−CP1))] − 0.09726/(0.95−CP) + 0.11434/(0.95−CB) + 0.75·Cstern·CV + 0.002·Cstern",
               name_l="W_L", name_b="W_B", bold=True)
     r_c10 = row("Coefficient c10", "c10",
                 "=IF(L_WL/B_MLD>5.2,B_MLD/L_WL,0.25-0.003328402/(B_MLD/L_WL-0.134615385))",
