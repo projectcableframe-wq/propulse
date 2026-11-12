@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>MALABAR RUSH — Episode 1: Thamarassery Churam</title>
+<style>
+  :root{
+    --gold:#e8b64c; --green:#0e5c3f; --emerald:#178a5c; --dark:#0b0f14;
+    --panel:rgba(10,16,22,.88); --line:rgba(232,182,76,.35); --txt:#eef3f0;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{width:100%;height:100%;overflow:hidden;background:var(--dark);color:var(--txt);
+    font-family:"Segoe UI",Roboto,Arial,sans-serif;touch-action:none;user-select:none;-webkit-user-select:none;}
+  #game-canvas{position:fixed;inset:0;width:100%;height:100%;display:block;}
+  .screen{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:radial-gradient(ellipse at 50% 30%,rgba(14,92,63,.25),rgba(5,8,12,.82));z-index:20;}
+  .hidden{display:none !important;}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px 30px;
+    max-width:min(680px,92vw);width:100%;max-height:88vh;overflow-y:auto;backdrop-filter:blur(8px);}
+  .title{font-size:clamp(34px,7vw,68px);font-weight:900;letter-spacing:4px;text-align:center;
+    background:linear-gradient(180deg,#fff 20%,var(--gold) 60%,#b8862b 100%);-webkit-background-clip:text;
+    background-clip:text;color:transparent;filter:drop-shadow(0 4px 18px rgba(232,182,76,.35));}
+  .subtitle{text-align:center;color:#cfe3d6;letter-spacing:6px;font-size:clamp(11px,2.2vw,16px);
+    text-transform:uppercase;margin-top:6px;}
+  .credit{text-align:center;color:#9db8a6;font-size:12px;letter-spacing:2px;margin:10px 0 22px;}
+  .btn{display:block;width:100%;margin:9px 0;padding:14px 18px;font-size:16px;font-weight:700;
+    letter-spacing:1.5px;text-transform:uppercase;color:var(--txt);background:linear-gradient(180deg,#123f2e,#0a2b1f);
+    border:1px solid var(--line);border-radius:11px;cursor:pointer;transition:transform .12s,box-shadow .12s;}
+  .btn:hover{transform:translateY(-2px);box-shadow:0 8px 22px rgba(232,182,76,.25);}
+  .btn.primary{background:linear-gradient(180deg,#e8b64c,#b8862b);color:#241a05;border-color:#f3d68c;}
+  .btn.small{width:auto;display:inline-block;margin:4px;padding:9px 16px;font-size:13px;}
+  h2{color:var(--gold);letter-spacing:3px;text-transform:uppercase;font-size:22px;margin-bottom:14px;text-align:center;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;}
+  .card{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:12px;padding:14px;margin:8px 0;}
+  .card.sel{border-color:var(--gold);box-shadow:0 0 0 2px rgba(232,182,76,.4) inset;}
+  .spec{width:100%;border-collapse:collapse;font-size:13px;}
+  .spec td{padding:4px 6px;border-bottom:1px solid rgba(255,255,255,.08);}
+  .spec td:first-child{color:#9db8a6;width:48%;}
+  .tag{display:inline-block;background:rgba(23,138,92,.3);border:1px solid var(--line);border-radius:20px;
+    padding:3px 11px;font-size:11px;letter-spacing:1px;margin:2px;color:#d8efe0;}
+  .setting-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0;}
+  .seg{display:flex;gap:6px;flex-wrap:wrap;}
+  .seg button{padding:8px 13px;border-radius:9px;border:1px solid var(--line);background:rgba(255,255,255,.06);
+    color:var(--txt);cursor:pointer;font-size:13px;}
+  .seg button.on{background:var(--gold);color:#241a05;font-weight:700;}
+  /* HUD */
+  #hud{position:fixed;inset:0;pointer-events:none;z-index:10;}
+  .hud-box{position:absolute;background:rgba(8,12,16,.62);border:1px solid rgba(232,182,76,.28);
+    border-radius:12px;padding:8px 12px;}
+  #hud-speed{left:16px;bottom:16px;min-width:150px;}
+  #speed-val{font-size:42px;font-weight:900;line-height:1;color:#fff;}
+  #speed-unit{font-size:12px;letter-spacing:3px;color:var(--gold);}
+  #nitro-track{width:150px;height:8px;background:rgba(255,255,255,.14);border-radius:6px;margin-top:8px;overflow:hidden;}
+  #nitro-fill{height:100%;width:100%;background:linear-gradient(90deg,#37c8ff,#7a5cff);border-radius:6px;}
+  #hud-race{top:14px;left:50%;transform:translateX(-50%);text-align:center;min-width:230px;}
+  #hud-race .big{font-size:22px;font-weight:800;color:var(--gold);letter-spacing:2px;}
+  #hud-race .small{font-size:12px;color:#cfe3d6;letter-spacing:1.5px;margin-top:2px;}
+  #hud-minimap{right:16px;top:16px;width:170px;height:170px;padding:6px;}
+  #minimap{width:100%;height:100%;border-radius:8px;}
+  #hud-msg{position:absolute;top:22%;left:50%;transform:translateX(-50%);font-size:28px;font-weight:900;
+    letter-spacing:4px;color:var(--gold);text-shadow:0 3px 16px rgba(0,0,0,.7);opacity:0;transition:opacity .3s;}
+  /* Touch controls */
+  #touch{position:fixed;inset:0;z-index:12;pointer-events:none;}
+  .tbtn{position:absolute;pointer-events:auto;width:74px;height:74px;border-radius:50%;
+    background:rgba(255,255,255,.13);border:2px solid rgba(255,255,255,.35);color:#fff;font-size:15px;
+    font-weight:800;display:flex;align-items:center;justify-content:center;letter-spacing:1px;}
+  .tbtn:active{background:rgba(232,182,76,.55);}
+  #t-left{left:18px;bottom:110px;} #t-right{left:108px;bottom:110px;}
+  #t-gas{right:18px;bottom:150px;width:88px;height:88px;background:rgba(23,138,92,.4);}
+  #t-brake{right:118px;bottom:96px;}
+  #t-nitro{right:18px;bottom:52px;background:rgba(55,200,255,.32);}
+  #t-hand{right:118px;bottom:200px;width:60px;height:60px;font-size:11px;}
+  .lens{position:absolute;right:16px;bottom:16px;}
+  #btn-mute{position:fixed;top:14px;left:16px;z-index:15;pointer-events:auto;width:44px;height:44px;
+    border-radius:10px;background:rgba(8,12,16,.62);border:1px solid var(--line);color:#fff;font-size:19px;cursor:pointer;}
+  .note{font-size:12px;color:#9db8a6;line-height:1.6;margin-top:10px;}
+  .gold{color:var(--gold);} .em{color:#5fe0a0;}
+  ::-webkit-scrollbar{width:8px;} ::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px;}
+</style>
+</head>
+<body>
+<canvas id="game-canvas"></canvas>
+
+<!-- ================= HUD ================= -->
+<div id="hud" class="hidden">
+  <div class="hud-box" id="hud-speed">
+    <div id="speed-val">0</div>
+    <div id="speed-unit">KM / H</div>
+    <div id="nitro-track"><div id="nitro-fill"></div></div>
+  </div>
+  <div class="hud-box" id="hud-race">
+    <div class="big" id="race-pos">P1 / 4</div>
+    <div class="small" id="race-lap">LAP 1 / 3</div>
+    <div class="small" id="race-time">00:00.00</div>
+    <div class="small" id="race-best">BEST --:--.--</div>
+  </div>
+  <div class="hud-box" id="hud-minimap"><canvas id="minimap" width="320" height="320"></canvas></div>
+  <div id="hud-msg"></div>
+</div>
+<button id="btn-mute" class="hidden" title="Sound">🔊</button>
+
+<!-- ================= TOUCH ================= -->
+<div id="touch" class="hidden">
+  <div class="tbtn" id="t-left">◀</div>
+  <div class="tbtn" id="t-right">▶</div>
+  <div class="tbtn" id="t-gas">GAS</div>
+  <div class="tbtn" id="t-brake">BRAKE</div>
+  <div class="tbtn" id="t-nitro">NITRO</div>
+  <div class="tbtn" id="t-hand">HAND<br>BRAKE</div>
+</div>
+
+<!-- ================= MENU ================= -->
+<div class="screen" id="screen-menu">
+  <div class="title">MALABAR RUSH</div>
+  <div class="subtitle" data-i18n="tagline">One State. Fourteen Districts. Unlimited Speed.</div>
+  <div class="credit" data-i18n="credit">EPISODE 1 · THAMARASSERY CHURAM · CREATED BY HADEE MOHAMMED</div>
+  <div class="panel" style="max-width:420px;">
+    <button class="btn primary" id="btn-race" data-i18n="startRace">🏁 Start Race — Churam Circuit</button>
+    <button class="btn" id="btn-time" data-i18n="timeTrial">⏱ Time Trial</button>
+    <button class="btn" id="btn-free" data-i18n="freeRoam">🌴 Free Roam — Explore</button>
+    <button class="btn" id="btn-garage" data-i18n="garage">🔧 Garage</button>
+    <button class="btn" id="btn-settings" data-i18n="settings">⚙ Settings</button>
+    <button class="btn" id="btn-about" data-i18n="about">ℹ About & Roadmap</button>
+  </div>
+</div>
+
+<!-- ================= GARAGE ================= -->
+<div class="screen hidden" id="screen-garage">
+  <div class="panel">
+    <h2 data-i18n="garage">🔧 Garage</h2>
+    <div class="row" style="justify-content:space-between;">
+      <div class="tag">💰 <span id="money-val">₹0</span></div>
+      <div class="tag">🏆 BEST LAP: <span id="bestlap-val">--:--.--</span></div>
+    </div>
+    <div id="car-list"></div>
+    <div class="note" data-i18n="garageNote">Inspired vehicles — original designs. Performance figures are game-adjusted stats, not manufacturer data.</div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn small primary" id="btn-garage-back" data-i18n="back">← Back</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= SETTINGS ================= -->
+<div class="screen hidden" id="screen-settings">
+  <div class="panel">
+    <h2 data-i18n="settings">⚙ Settings</h2>
+    <div class="setting-row"><span data-i18n="quality">Graphics Quality</span>
+      <div class="seg" id="seg-quality">
+        <button data-v="LOW">Low</button><button data-v="MED">Med</button><button data-v="HIGH">High</button>
+      </div></div>
+    <div class="setting-row"><span data-i18n="weather">Weather</span>
+      <div class="seg" id="seg-weather">
+        <button data-v="CLEAR">Clear</button><button data-v="MIST">Mist</button><button data-v="RAIN">Rain</button>
+      </div></div>
+    <div class="setting-row"><span data-i18n="timeOfDay">Time of Day</span>
+      <div class="seg" id="seg-time">
+        <button data-v="DAY">Day</button><button data-v="SUNSET">Sunset</button><button data-v="NIGHT">Night</button>
+      </div></div>
+    <div class="setting-row"><span data-i18n="sound">Sound</span>
+      <div class="seg" id="seg-sound">
+        <button data-v="ON">On</button><button data-v="OFF">Off</button>
+      </div></div>
+    <div class="setting-row"><span data-i18n="language">Language</span>
+      <div class="seg" id="seg-lang">
+        <button data-v="EN">English</button><button data-v="ML">മലയാളം</button>
+      </div></div>
+    <div class="note" data-i18n="controlsNote">Controls: WASD / Arrows drive · Space handbrake · Shift nitro · C camera · R reset · Esc pause</div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn small primary" id="btn-settings-back" data-i18n="back">← Back</button>
+      <button class="btn small" id="btn-reset-save" data-i18n="resetSave">Reset Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= ABOUT ================= -->
+<div class="screen hidden" id="screen-about">
+  <div class="panel">
+    <h2 data-i18n="about">ℹ About & Roadmap</h2>
+    <p class="note">MALABAR RUSH — a 3D open-world arcade racing game across Kerala.
+    <b class="gold">Episode 1: Thamarassery Churam</b> is playable now.</p>
+    <div class="card">
+      <div class="spec">
+        <tr><td>Episode 1 — Kozhikode ↔ Wayanad</td><td class="em">✅ PLAYABLE</td></tr>
+        <tr><td>Episode 2 — Idukki (Munnar)</td><td>planned</td></tr>
+        <tr><td>Episode 3 — Ernakulam (Kochi)</td><td>planned</td></tr>
+        <tr><td>Episodes 4–14 — all remaining districts</td><td>roadmap</td></tr>
+        <tr><td>Full connected Kerala open world</td><td>roadmap</td></tr>
+      </div>
+    </div>
+    <div class="note">Original UI, map and assets. Vehicle names are fictionalised;
+    real brands require licensing. Family-friendly, ages 10+.</div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn small primary" id="btn-about-back" data-i18n="back">← Back</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= PAUSE ================= -->
+<div class="screen hidden" id="screen-pause">
+  <div class="panel" style="max-width:400px;">
+    <h2 data-i18n="paused">⏸ Paused</h2>
+    <button class="btn primary" id="btn-resume" data-i18n="resume">▶ Resume</button>
+    <button class="btn" id="btn-restart" data-i18n="restart">↺ Restart</button>
+    <button class="btn" id="btn-quit" data-i18n="mainMenu">🏠 Main Menu</button>
+  </div>
+</div>
+
+<!-- ================= RESULTS ================= -->
+<div class="screen hidden" id="screen-results">
+  <div class="panel" style="max-width:440px;">
+    <h2 id="result-title">🏁 RACE COMPLETE</h2>
+    <div class="card">
+      <div class="spec">
+        <tr><td data-i18n="position">Position</td><td id="result-pos">1st</td></tr>
+        <tr><td data-i18n="bestLap">Best Lap</td><td id="result-lap">--:--.--</td></tr>
+        <tr><td data-i18n="totalTime">Total Time</td><td id="result-time">--:--.--</td></tr>
+        <tr><td data-i18n="prize">Prize</td><td id="result-money" class="gold">₹0</td></tr>
+      </div>
+    </div>
+    <button class="btn primary" id="btn-race-again" data-i18n="raceAgain">🏁 Race Again</button>
+    <button class="btn" id="btn-results-menu" data-i18n="mainMenu">🏠 Main Menu</button>
+  </div>
+</div>
+
+<script src="libs/three.min.js"></script>
+<script src="js/game.js"></script>
+</body>
+</html>
