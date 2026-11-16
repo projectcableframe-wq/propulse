@@ -1,0 +1,28 @@
+# Faisaa — Cloudflare Worker with KV-backed device sync
+#
+# Deploy from this folder:
+#   1. npx wrangler login
+#   2. npx wrangler kv namespace create FAISAA_KV     # copy the id below
+#   3. npx wrangler secret put FAISAA_PIN             # choose a PIN, e.g. 4-6 digits
+#   4. npx wrangler deploy
+#
+# The dashboard "upload static files" flow cannot deploy this file — a script
+# is required for the /api routes. Wrangler is the way.
+
+name = "faisa"
+main = "_worker.js"
+compatibility_date = "2024-11-01"
+
+[assets]
+directory = "."
+binding = "ASSETS"
+# index.html is served for "/" automatically
+html_handling = "auto-trailing-slash"
+not_found_handling = "single-page-application"
+
+# Create with:
+#   npx wrangler kv namespace create FAISAA_KV
+# then paste the returned id here.
+[[kv_namespaces]]
+binding = "FAISAA_KV"
+id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"

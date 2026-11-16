@@ -13,14 +13,19 @@
 <script>
 /* Faisaa sync client
    Layer 1: localStorage  → survives reload/airplane mode, instant boot.
-   Layer 2: WebSocket     → realtime push/pull between devices.
+   Layer 2: /api/ops      → pushes ops to the Worker (KV-backed ledger) and
+                            receives whatever other devices changed.
    Layer 3: outbox        → ops made offline replay in order on reconnect.
-   The UI never awaits the network: every change applies locally first. */
+   The UI never awaits the network: every change applies locally first.
+   Polling is used instead of WebSockets: a Worker has no durable in-memory
+   state, and iOS kills sockets anyway when the app backgrounds. */
 (function(){
   const LS_STATE  = 'faisaa.state.v1';
   const LS_OUTBOX = 'faisaa.outbox.v1';
   const LS_DEVICE = 'faisaa.deviceId';
   const LS_NAME   = 'faisaa.deviceName';
+  const LS_PIN    = 'faisaa.pin';
+  const LS_REV    = 'faisaa.rev';
 
   function guessName(){
     const ua = navigator.userAgent;
@@ -61,79 +66,150 @@
     /* ---- outbound ops ---- */
     push(entity, id, op, data){
       const rec = { entity, id, op, data: data||null, ts: Date.now(), dev: deviceId };
+      // Lightweight duplicate guard: identical op already queued and unsent.
+      const last = this.outbox[this.outbox.length-1];
+      if (last && last.entity===entity && last.id===id && last.op===op &&
+          JSON.stringify(last.data)===JSON.stringify(rec.data) && rec.ts-last.ts<800) return;
       this.outbox.push(rec);
       store.set(LS_OUTBOX, this.outbox);
+      this.status();
       this.flush();
     },
+
+    /* Send the outbox. Never throws, never blocks the UI. */
     flush(){
-      if (!this.enabled || !this.outbox.length) return;
-      if (this.ws && this.ws.readyState === 1){
-        try {
-          this.ws.send(JSON.stringify({ type:'ops', ops:this.outbox, deviceId }));
-          this.outbox = []; store.set(LS_OUTBOX, this.outbox);
-          this.status();
-        } catch(_){}
-      } else if (navigator.onLine) {
-        // WebSocket down but the network is up — fall back to HTTP.
-        const batch = this.outbox.slice();
-        fetch('/api/ops', { method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ ops:batch, deviceId }) })
-          .then(r=>r.ok?r.json():null)
-          .then(j=>{ if(j&&j.ok){ this.outbox = this.outbox.slice(batch.length);
-                                  store.set(LS_OUTBOX,this.outbox); this.status(); } })
-          .catch(()=>{});
+      if (!this.enabled || !this.outbox.length || this.inflight) return;
+      if (!navigator.onLine) { this.status(); return; }
+      if (!this.pin) { this.status(); return; }   // waiting for the user's PIN
+
+      const batch = this.outbox.slice(0, 400);
+      this.inflight = true;
+      fetch('/api/ops', {
+        method:'POST',
+        headers: Object.assign({'Content-Type':'application/json'}, this.authHeaders()),
+        body: JSON.stringify({ ops:batch, deviceId, since:this.rev||0, deviceName })
+      })
+      .then(r=>{
+        if (r.status===401){ this.pin=null; store.rawSet(LS_PIN,''); this.needPin=true;
+                             this.online=false; this.status(); this.onAuth && this.onAuth(); return null; }
+        return r.ok ? r.json() : null;
+      })
+      .then(j=>{
+        this.inflight=false;
+        if (!j || !j.ok){ this.status(); this.scheduleRetry(); return; }
+        // Drop exactly what the server accepted.
+        this.outbox = this.outbox.slice(batch.length);
+        store.set(LS_OUTBOX, this.outbox);
+        this.rev = j.rev;
+        store.rawSet(LS_REV, String(j.rev));
+        this.online = true; this.tries = 0;
+        // Anything other devices wrote while we were away.
+        if (j.missed && j.missed.length && this.onchange) this.onchange(j.missed,'ops');
+        this.status();
+        if (this.outbox.length) this.flush();
+      })
+      .catch(()=>{ this.inflight=false; this.online=false; this.status(); this.scheduleRetry(); });
+    },
+
+    authHeaders(){
+      const h = {};
+      if (this.pin) h['x-faisaa-pin'] = this.pin;
+      return h;
+    },
+
+    /* Ask the server whether it knows a PIN. */
+    probePin(){
+      return fetch('/api/ping', { headers:this.authHeaders(), cache:'no-store' })
+        .then(r=>r.status===401 ? 'required' : (r.ok ? 'ok' : 'down'))
+        .catch(()=>'down');
+    },
+
+    setPin(pin){
+      this.pin = pin || '';
+      store.rawSet(LS_PIN, this.pin);
+      this.needPin = false;
+      this.tries = 0;
+      this.pull(true).then(()=>{ this.flush(); });
+    },
+
+    /* Full pull — used on boot, on reconnect, and when we suspect we're stale. */
+    pull(force){
+      if (!this.enabled) return Promise.resolve(null);
+      if (!this.pin){ return this.probePin().then(st=>{
+          if (st==='required'){ this.needPin=true; this.status(); this.onAuth && this.onAuth(); return null; }
+          if (st==='ok'){ return this.fetchState(force); }
+          this.online=false; this.status(); return null;
+        });
       }
+      return this.fetchState(force);
     },
 
-    /* ---- connection ---- */
-    connect(){
-      if (!this.enabled) return;
-      if (this.ws && (this.ws.readyState===0 || this.ws.readyState===1)) return;
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const url = `${proto}://${location.host}/ws?id=${encodeURIComponent(deviceId)}&name=${encodeURIComponent(deviceName)}`;
-      let ws;
-      try { ws = new WebSocket(url); } catch(_) { return this.retry(); }
-      this.ws = ws;
-
-      ws.onopen = ()=>{ this.tries=0; this.online=true; this.status(); this.flush(); };
-      ws.onmessage = ev=>{
-        let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
-        if (m.type==='hello'){
-          this.rev = m.rev;
-          // Server is authoritative on connect, then our queued ops replay on top.
-          if (this.onchange) this.onchange(m.state, 'hello');
-          this.flush();
-        } else if (m.type==='ops'){
-          this.rev = m.rev;
-          if (this.onchange) this.onchange(m.ops, 'ops');
-        } else if (m.type==='presence'){
-          this.peers = Math.max(0, m.count-1);
-          this.peerNames = (m.devices||[]).filter(n=>n!==deviceName);
+    fetchState(force){
+      return fetch('/api/state', { headers:this.authHeaders(), cache:'no-store' })
+        .then(r=>{
+          if (r.status===401){ this.pin=null; store.rawSet(LS_PIN,''); this.needPin=true;
+                               this.online=false; this.status(); this.onAuth && this.onAuth(); return null; }
+          return r.ok ? r.json() : null;
+        })
+        .then(j=>{
+          if (!j || !j.ok){ this.online=false; this.status(); return null; }
+          this.online = true; this.tries = 0;
+          this.rev = j.rev|0;
+          store.rawSet(LS_REV, String(j.rev));
+          if (this.onchange) this.onchange(j.state,'hello');
           this.status();
-        } else if (m.type==='reload'){ location.reload(); }
-      };
-      ws.onclose = ()=>{ this.online=false; this.ws=null; this.status(); this.retry(); };
-      ws.onerror = ()=>{ try{ ws.close(); }catch(_){} };
+          return j;
+        })
+        .catch(()=>{ this.online=false; this.status(); this.scheduleRetry(); return null; });
     },
-    retry(){
+
+    /* Cheap change check. */
+    poll(){
+      if (!this.enabled || !this.pin) return;
+      if (typeof navigator!=='undefined' && !navigator.onLine) return;
+      if (this.inflight) return;
+      fetch('/api/ping', { headers:this.authHeaders(), cache:'no-store' })
+        .then(r=> r.status===401 ? {auth:true} : (r.ok ? r.json() : null))
+        .then(j=>{
+          if (!j) { this.online=false; this.status(); return; }
+          if (j.auth){ this.pin=null; this.needPin=true; this.status(); this.onAuth && this.onAuth(); return; }
+          this.online = true;
+          if ((j.rev|0) !== (this.rev|0)) this.fetchState(false);
+          this.status();
+        })
+        .catch(()=>{ this.online=false; this.status(); });
+    },
+
+    scheduleRetry(){
       if (!this.enabled) return;
       clearTimeout(this.timer);
-      const wait = Math.min(1000 * Math.pow(1.6, this.tries++), 15000);
-      this.timer = setTimeout(()=>this.connect(), wait + Math.random()*400);
+      const wait = Math.min(1500 * Math.pow(1.6, this.tries++), 20000);
+      this.timer = setTimeout(()=>{ this.flush(); if(!this.online) this.pull(false); }, wait + Math.random()*500);
     },
+
     status(){ if (this.onstatus) this.onstatus(this); },
 
     start(){
-      this.connect();
-      addEventListener('online',  ()=>{ this.tries=0; this.connect(); this.flush(); });
-      addEventListener('offline', ()=>{ this.online=false; this.status(); });
-      // Coming back from the iOS app switcher: sockets are often silently dead.
-      document.addEventListener('visibilitychange', ()=>{
-        if (!document.hidden){ this.connect(); this.flush(); }
+      this.pin = store.raw(LS_PIN) || '';
+      this.rev = Number(store.raw(LS_REV, '0')) || 0;
+
+      this.pull(true).then(()=>{ this.flush(); });
+
+      addEventListener('online', ()=>{ this.tries=0; this.pull(true).then(()=>this.flush()); });
+      addEventListener('offline',()=>{ this.online=false; this.status(); });
+
+      // Coming back from the iOS app switcher: sockets/polls may be dead.
+      document.addEventListener('visibilitychange',()=>{
+        if (!document.hidden){ this.pull(false).then(()=>this.flush()); }
       });
-      setInterval(()=>{ if(this.ws && this.ws.readyState===1)
-        { try{ this.ws.send(JSON.stringify({type:'ping'})); }catch(_){} } }, 20000);
-    }
+
+      // Steady poll — cheap (a single KV read) and enough for three devices.
+      clearInterval(this._poll);
+      this._poll = setInterval(()=>{ if (!document.hidden) this.poll(); }, 12000);
+    },
+
+    /* Forget this device's PIN (used by Settings → Disconnect). */
+    signOut(){ this.pin=''; store.rawSet(LS_PIN,''); this.needPin=true; this.status(); }
   };
   window.FaisaaSync = Sync;
 })();
@@ -1406,6 +1482,8 @@ function openSheet(kind,data){
     sheetState.form=b
       ? {id:b.id,cat:b.categoryId,cur:b.currency,raw:String(b.limit/100),errs:{}}
       : {cat:(data&&data.cat)||'c1',cur,raw:'',errs:{}};
+  } else if(kind==='pin'){
+    sheetState.form={pin:'',errs:{}};
   } else if(kind==='delAcct'){
     sheetState.form={choice:0,target:null,errs:{}};
   }
@@ -1823,6 +1901,17 @@ function vSettings(){
     <div class="group">
       <div class="field"><label style="flex:1">Status</label>
         <span id="syncStatusLine" style="font-size:15px;color:var(--txt3);text-align:right">…</span></div>
+      ${!Sync.pin?`<div class="field tap" onclick="openSheet('pin')">
+        <label style="flex:1;color:var(--inr);font-weight:500">Connect this device</label>
+        <span class="chev">›</span></div>`
+      :`<div class="field tap" onclick="openSheet('pin')">
+        <label style="flex:1">Change PIN</label><span class="chev">›</span></div>
+        <div class="field tap" onclick="forceUpload()">
+        <label style="flex:1">Upload this device's data</label>
+        <span style="font-size:13px;color:var(--txt3)">replace server</span>
+        <span class="chev">›</span></div>
+        <div class="field tap" onclick="disconnectDevice()">
+        <label style="flex:1;color:var(--inr)">Disconnect this device</label></div>`}
       <div class="field"><label style="flex:1">This device</label>
         <input value="${Sync.deviceName}" style="max-width:150px"
           onchange="Sync.setName(this.value);toast('ok','Renamed to '+this.value)"></div>
@@ -1831,8 +1920,9 @@ function vSettings(){
       ${Sync.peerNames.length?`<div class="field"><label style="flex:1">Also connected</label>
         <span style="font-size:15px;color:var(--txt3)">${Sync.peerNames.join(', ')}</span></div>`:''}
     </div>
-    <div class="groupfoot">Changes save on this device instantly and sync to your other devices in real time.
-      Anything made offline is queued and sent automatically when you reconnect.</div>
+    <div class="groupfoot">Changes save on this device instantly, then push to your private server and
+      appear on your other devices within a few seconds. Anything made offline is queued and sent when you
+      reconnect. ${!Sync.pin?'<b style="color:var(--inr)">Not connected yet — tap “Connect this device”.</b>':''}</div>
 
     <div class="grouphead">Developer</div>
     <div class="group">
@@ -2697,6 +2787,29 @@ function renderSheet(){
       <div style="height:24px"></div>`;
   }
 
+  else if(k==='pin'){
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button>
+      <span class="t">Connect Device</span>
+      <button class="pri" onclick="submitPin()">Connect</button>`;
+    body.innerHTML=`
+      <div style="text-align:center;padding:10px 0 18px">
+        <div style="font-size:42px;line-height:1">🔐</div>
+        <h3 style="margin:10px 0 6px;font-size:19px;letter-spacing:-.4px">Enter your PIN</h3>
+        <p style="margin:0;font-size:14px;color:var(--txt3);line-height:1.45;letter-spacing:-.2px">
+          Faisaa stores your ledger on a private server so your phone, iPad and laptop stay in step.
+          The PIN is the one set in your Cloudflare Worker (<b>FAISAA_PIN</b>).</p>
+      </div>
+      <div class="amountbox"><div class="amountrow"><span class="sym">•</span>
+        <input id="pinInput" inputmode="numeric" type="password" autocomplete="off" placeholder="PIN"
+          value="${esc(f.pin)}" autofocus
+          oninput="sheetState.form.pin=this.value;sheetState.form.errs={}"
+          onkeydown="if(event.key==='Enter')submitPin()"></div></div>
+      ${f.errs.pin?`<div class="err">⚠ ${f.errs.pin}</div>`:''}
+      <div class="note blue" style="margin-top:16px">ⓘ Your data is only readable with this PIN.
+        It is kept on this device and never shown again.</div>
+      <div style="height:24px"></div>`;
+  }
+
   else if(k==='delAcct'){
     const a=acct(sheetState.data.id),n=S.txns.filter(t=>t.accountId===a.id).length;
     const targets=active().filter(x=>x.id!==a.id&&x.currency===a.currency);
@@ -2913,6 +3026,42 @@ function saveAcct__inner(){
     enqueue('account','create');toast('ok',f.name.trim()+' added');
   }
   closeSheet();render();
+}
+
+/* ---- CONNECT A DEVICE ---- */
+/* First device to connect seeds the server with whatever it already has; later
+   devices pull that ledger down. This is why the PIN sheet matters: it is the
+   one moment where local and remote data could collide, so we make it explicit. */
+function submitPin(){
+  const f=sheetState.form, pin=(f.pin||'').trim();
+  f.errs={};
+  if(!pin){ f.errs.pin='Enter the PIN'; renderSheet(); return }
+  if(!window.FaisaaSync || !Sync.probePin){ f.errs.pin='Sync is not available'; renderSheet(); return }
+
+  // Try the PIN before storing it.
+  Sync.pin = pin;
+  Sync.probePin().then(res=>{
+    if(res==='required'){ Sync.pin=''; f.errs.pin='That PIN is not right'; renderSheet(); return }
+    if(res==='down'){ Sync.pin=''; f.errs.pin='Could not reach the server — check your connection'; renderSheet(); return }
+    Sync.setPin(pin);          // stored only after it works
+    closeSheet();
+    toast('ok','Connected — syncing your ledger');
+    setTimeout(()=>{ try{ render(); }catch(_){} },60);
+  }).catch(()=>{ Sync.pin=''; f.errs.pin='Could not reach the server'; renderSheet(); });
+}
+
+function disconnectDevice(){
+  if(!confirm('Stop syncing this device? Your data stays here; it just stops sharing changes.')) return;
+  Sync.signOut();
+  render();
+  toast('info','This device is no longer syncing');
+}
+
+/* Push everything this device holds to the server (Settings → Force upload). */
+function forceUpload(){
+  uploadEverything();
+  toast('ok','Uploading this device\'s ledger');
+  setTimeout(()=>Sync.flush(),300);
 }
 
 function saveBudget__inner(){
@@ -3155,21 +3304,27 @@ Sync.onchange = (payload, kind)=>{
   }
 };
 Sync.onstatus = ()=>{ paintSyncPill(); };
+// The Worker asked for a PIN (or the stored one was wrong): show the prompt once.
+Sync.onAuth = ()=>{ if(!sheetState || !sheetState.kind) openSheet('pin'); };
+
 
 function paintSyncPill(){
   const el=document.getElementById('syncPill');
   if(!el || !window.FaisaaSync) return;
-  const on=Sync.online, q=Sync.outbox.length;
-  el.className='syncpill '+(on?(Sync.peers?'live':'ok'):'off');
-  el.innerHTML = on
-    ? (Sync.peers
-        ? `<i class="dot"></i>${Sync.peers+1} devices live`
-        : (q?`<i class="dot"></i>Syncing ${q}`:`<i class="dot"></i>Synced`))
-    : `<i class="dot"></i>${q?q+' queued':'Offline'}`;
+  const on=Sync.online, q=Sync.outbox.length, needPin=Sync.needPin;
+  // Never claim "Synced" unless the server actually acknowledged us.
+  el.className='syncpill '+(on?'ok':(needPin?'live':'off'));
+  el.innerHTML = needPin
+    ? `<i class="dot"></i>PIN needed`
+    : on
+      ? (q?`<i class="dot"></i>Syncing ${q}`:`<i class="dot"></i>Synced`)
+      : `<i class="dot"></i>${q?q+' queued':'On this device'}`;
   const st=document.getElementById('syncStatusLine');
-  if(st) st.textContent = on
-    ? (Sync.peers?`Live · ${Sync.peers+1} devices connected`:'Connected · waiting for other devices')
-    : (q?`Offline · ${q} change${q>1?'s':''} queued`:'Offline · changes saved on this device');
+  if(st) st.textContent = needPin
+    ? 'Enter your PIN to sync this device'
+    : on
+      ? (q?`Syncing ${q} change${q>1?'s':''}…`:`Connected · shared with your other devices`)
+      : (q?`Offline · ${q} change${q>1?'s':''} will send when back online`:'Not syncing · changes saved on this device only');
 }
 
 /* ---- Boot ---- */
