@@ -1,0 +1,3250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" id="themeColor" content="#F2F2F7">
+<title>Faisaa</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<script>
+/* Faisaa sync client
+   Layer 1: localStorage  → survives reload/airplane mode, instant boot.
+   Layer 2: WebSocket     → realtime push/pull between devices.
+   Layer 3: outbox        → ops made offline replay in order on reconnect.
+   The UI never awaits the network: every change applies locally first. */
+(function(){
+  const LS_STATE  = 'faisaa.state.v1';
+  const LS_OUTBOX = 'faisaa.outbox.v1';
+  const LS_DEVICE = 'faisaa.deviceId';
+  const LS_NAME   = 'faisaa.deviceName';
+
+  function guessName(){
+    const ua = navigator.userAgent;
+    if (/iPhone/.test(ua)) return 'iPhone';
+    if (/iPad/.test(ua))   return 'iPad';
+    if (/Android/.test(ua))return 'Android';
+    if (/Mac/.test(ua))    return 'Mac';
+    if (/Windows/.test(ua))return 'PC';
+    return 'Device';
+  }
+  const store = {
+    get(k,d){ try{ const v=localStorage.getItem(k); return v?JSON.parse(v):d; }catch(_){ return d; } },
+    set(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); return true; }catch(_){ return false; } },
+    raw(k,d){ try{ return localStorage.getItem(k)||d; }catch(_){ return d; } },
+    rawSet(k,v){ try{ localStorage.setItem(k,v); }catch(_){} }
+  };
+
+  let deviceId = store.raw(LS_DEVICE);
+  if (!deviceId){ deviceId = 'd'+Math.random().toString(36).slice(2,10); store.rawSet(LS_DEVICE, deviceId); }
+  let deviceName = store.raw(LS_NAME) || guessName();
+  store.rawSet(LS_NAME, deviceName);
+
+  const Sync = {
+    deviceId, deviceName,
+    online:false, peers:0, peerNames:[], rev:0,
+    outbox: store.get(LS_OUTBOX, []),
+    ws:null, tries:0, timer:null, onchange:null, onstatus:null,
+    enabled: true,
+
+    /* ---- local snapshot ---- */
+    loadLocal(){ return store.get(LS_STATE, null); },
+    saveLocal(snapshot){ store.set(LS_STATE, snapshot); },
+    clearLocal(){ try{ localStorage.removeItem(LS_STATE); localStorage.removeItem(LS_OUTBOX); }catch(_){} this.outbox=[]; },
+
+    setName(n){ deviceName=this.deviceName=n||guessName(); store.rawSet(LS_NAME, deviceName);
+                if(this.ws) try{ this.ws.close(); }catch(_){} },
+
+    /* ---- outbound ops ---- */
+    push(entity, id, op, data){
+      const rec = { entity, id, op, data: data||null, ts: Date.now(), dev: deviceId };
+      this.outbox.push(rec);
+      store.set(LS_OUTBOX, this.outbox);
+      this.flush();
+    },
+    flush(){
+      if (!this.enabled || !this.outbox.length) return;
+      if (this.ws && this.ws.readyState === 1){
+        try {
+          this.ws.send(JSON.stringify({ type:'ops', ops:this.outbox, deviceId }));
+          this.outbox = []; store.set(LS_OUTBOX, this.outbox);
+          this.status();
+        } catch(_){}
+      } else if (navigator.onLine) {
+        // WebSocket down but the network is up — fall back to HTTP.
+        const batch = this.outbox.slice();
+        fetch('/api/ops', { method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ops:batch, deviceId }) })
+          .then(r=>r.ok?r.json():null)
+          .then(j=>{ if(j&&j.ok){ this.outbox = this.outbox.slice(batch.length);
+                                  store.set(LS_OUTBOX,this.outbox); this.status(); } })
+          .catch(()=>{});
+      }
+    },
+
+    /* ---- connection ---- */
+    connect(){
+      if (!this.enabled) return;
+      if (this.ws && (this.ws.readyState===0 || this.ws.readyState===1)) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = `${proto}://${location.host}/ws?id=${encodeURIComponent(deviceId)}&name=${encodeURIComponent(deviceName)}`;
+      let ws;
+      try { ws = new WebSocket(url); } catch(_) { return this.retry(); }
+      this.ws = ws;
+
+      ws.onopen = ()=>{ this.tries=0; this.online=true; this.status(); this.flush(); };
+      ws.onmessage = ev=>{
+        let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
+        if (m.type==='hello'){
+          this.rev = m.rev;
+          // Server is authoritative on connect, then our queued ops replay on top.
+          if (this.onchange) this.onchange(m.state, 'hello');
+          this.flush();
+        } else if (m.type==='ops'){
+          this.rev = m.rev;
+          if (this.onchange) this.onchange(m.ops, 'ops');
+        } else if (m.type==='presence'){
+          this.peers = Math.max(0, m.count-1);
+          this.peerNames = (m.devices||[]).filter(n=>n!==deviceName);
+          this.status();
+        } else if (m.type==='reload'){ location.reload(); }
+      };
+      ws.onclose = ()=>{ this.online=false; this.ws=null; this.status(); this.retry(); };
+      ws.onerror = ()=>{ try{ ws.close(); }catch(_){} };
+    },
+    retry(){
+      if (!this.enabled) return;
+      clearTimeout(this.timer);
+      const wait = Math.min(1000 * Math.pow(1.6, this.tries++), 15000);
+      this.timer = setTimeout(()=>this.connect(), wait + Math.random()*400);
+    },
+    status(){ if (this.onstatus) this.onstatus(this); },
+
+    start(){
+      this.connect();
+      addEventListener('online',  ()=>{ this.tries=0; this.connect(); this.flush(); });
+      addEventListener('offline', ()=>{ this.online=false; this.status(); });
+      // Coming back from the iOS app switcher: sockets are often silently dead.
+      document.addEventListener('visibilitychange', ()=>{
+        if (!document.hidden){ this.connect(); this.flush(); }
+      });
+      setInterval(()=>{ if(this.ws && this.ws.readyState===1)
+        { try{ this.ws.send(JSON.stringify({type:'ping'})); }catch(_){} } }, 20000);
+    }
+  };
+  window.FaisaaSync = Sync;
+})();
+</script>
+<script>
+/* Fallback: if the sync client ever fails to load (file preview, offline,
+   sandboxed iframe), the app must still boot — never a blank screen.
+   This stub provides the same interface, backed by in-memory storage. */
+if(!window.FaisaaSync){
+  (function(){
+    var mem = {};
+    var store = {
+      get:function(k,d){ try{ var v=localStorage.getItem(k); return v?JSON.parse(v):d; }catch(_){ return (k in mem)?mem[k]:d; } },
+      set:function(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(_){ mem[k]=v; } return true; },
+      raw:function(k,d){ try{ return localStorage.getItem(k)||d; }catch(_){ return mem[k]||d; } },
+      rawSet:function(k,v){ try{ localStorage.setItem(k,v); }catch(_){ mem[k]=v; } }
+    };
+    var deviceId = store.raw('faisaa.deviceId') || ('d'+Math.random().toString(36).slice(2,10));
+    store.rawSet('faisaa.deviceId', deviceId);
+    window.FaisaaSync = {
+      deviceId: deviceId, deviceName: store.raw('faisaa.deviceName') || 'Device',
+      online:false, peers:0, peerNames:[], rev:0, outbox:[], ws:null,
+      onchange:null, onstatus:null, enabled:false,
+      loadLocal:function(){ return store.get('faisaa.state.v1', null); },
+      saveLocal:function(s){ store.set('faisaa.state.v1', s); },
+      clearLocal:function(){ try{ localStorage.removeItem('faisaa.state.v1'); }catch(_){} delete mem['faisaa.state.v1']; this.outbox=[]; },
+      setName:function(n){ this.deviceName=n||'Device'; store.rawSet('faisaa.deviceName', this.deviceName); },
+      push:function(){}, flush:function(){}, start:function(){}, status:function(){}
+    };
+  })();
+}
+</script>
+
+<script>
+/* Applied before first paint so there is never a flash of the wrong theme. */
+(function(){
+  var pref='system';
+  try{ pref=localStorage.getItem('faisaa.appearance')||'system'; }catch(e){}
+  var mq=window.matchMedia('(prefers-color-scheme: dark)');
+  var resolve=function(p){ return p==='system' ? (mq.matches?'dark':'light') : p; };
+  var apply=function(p){
+    var mode=resolve(p);
+    document.documentElement.setAttribute('data-theme',mode);
+    var m=document.getElementById('themeColor');
+    if(m) m.setAttribute('content', mode==='dark'?'#000000':'#F2F2F7');
+  };
+  window.__theme={
+    pref:pref, resolve:resolve, apply:apply,
+    set:function(p){
+      this.pref=p;
+      try{ localStorage.setItem('faisaa.appearance',p); }catch(e){}
+      document.documentElement.classList.add('theme-anim');
+      apply(p);
+      clearTimeout(this._t);
+      this._t=setTimeout(function(){ document.documentElement.classList.remove('theme-anim'); },400);
+    }
+  };
+  apply(pref);
+  // Follow the OS only while the user is on "System".
+  var onSys=function(){ if(window.__theme.pref==='system') apply('system'); };
+  mq.addEventListener ? mq.addEventListener('change',onSys) : mq.addListener(onSys);
+})();
+</script>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
+
+  :root{
+    --inr:#2E5BFF; --inr2:#1B3FCC; --mvr:#00A88E; --mvr2:#00806C;
+    --red:#FF3B30; --green:#34C759; --orange:#FF9500;
+    --bg:#F2F2F7;
+    --card:#FFFFFF;
+    --card2:rgba(118,118,128,.08);
+    --sep:rgba(60,60,67,.13);
+    --txt:#000; --txt2:#3C3C43; --txt3:rgba(60,60,67,.6); --txt4:rgba(60,60,67,.3);
+    --barbg:rgba(249,249,249,.82);
+    --fill:rgba(118,118,128,.12);
+    --sheetbg:#F2F2F7;
+    --safe-t:env(safe-area-inset-top,0px);
+    --safe-b:env(safe-area-inset-bottom,0px);
+    --tabh:49px;
+  }
+  :root[data-theme="dark"]{
+    --bg:#000000; --card:#1C1C1E; --card2:rgba(118,118,128,.18);
+    --sep:rgba(84,84,88,.55);
+    --txt:#fff; --txt2:#EBEBF5; --txt3:rgba(235,235,245,.6); --txt4:rgba(235,235,245,.3);
+    --barbg:rgba(28,28,30,.8); --fill:rgba(118,118,128,.24); --sheetbg:#1C1C1E;
+  }
+
+  /* Cross-fade the palette on theme change; suppressed on first paint. */
+  :root.theme-anim,
+  :root.theme-anim body,
+  :root.theme-anim .card,.theme-anim .field,.theme-anim .group,.theme-anim .row,
+  :root.theme-anim .navbar,.theme-anim .tabbar,.theme-anim .sheet,.theme-anim .catbar,
+  :root.theme-anim .seg,.theme-anim .seg button,.theme-anim .note,.theme-anim .toast,
+  :root.theme-anim .amountbox,.theme-anim .addcard,.theme-anim .chip,.theme-anim .track{
+    transition:background-color .32s ease,color .32s ease,box-shadow .32s ease;
+  }
+
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Segoe UI",Roboto,sans-serif;
+    font-size:17px;line-height:1.3;overflow:hidden;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  }
+
+  /* ===== App shell: fills the viewport, no frame ===== */
+  #app{position:fixed;inset:0;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+  .wrap{width:100%;max-width:680px;margin:0 auto}
+
+  /* ===== Nav bar ===== */
+  .navbar{
+    flex:0 0 auto;z-index:50;position:relative;
+    padding:calc(var(--safe-t) + 6px) 0 6px;
+    background:var(--barbg);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+    box-shadow:0 0 0 rgba(0,0,0,0);transition:box-shadow .25s ease;
+  }
+  .navbar.scrolled{box-shadow:0 .5px 0 var(--sep)}
+  .navbar .row{display:flex;align-items:center;justify-content:space-between;min-height:42px;padding:0 16px;gap:8px}
+  .navbar h1{margin:0;font-size:34px;font-weight:700;letter-spacing:-.9px;font-family:-apple-system,"SF Pro Display",sans-serif}
+  .navbar .inline{font-size:17px;font-weight:600;letter-spacing:-.2px;flex:1;text-align:center}
+  .navbtn{background:none;border:none;color:var(--inr);font-size:24px;cursor:pointer;padding:4px;
+          display:flex;align-items:center;justify-content:center;min-width:34px;transition:opacity .15s}
+  .navbtn:active{opacity:.4}
+  .navbtn:disabled{opacity:.3;cursor:default}
+  .backbtn{background:none;border:none;color:var(--inr);font-size:17px;cursor:pointer;
+           display:flex;align-items:center;gap:2px;padding:4px 0;min-width:34px;transition:opacity .15s}
+  .backbtn:active{opacity:.4}
+  .backbtn i{font-style:normal;font-size:26px;font-weight:300;line-height:.9;margin-top:-2px}
+
+  /* ===== Scroll area ===== */
+  .screen{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;
+          padding:8px 0 calc(var(--tabh) + var(--safe-b) + 28px);scroll-behavior:smooth;overscroll-behavior-y:contain}
+  .screen::-webkit-scrollbar{width:0;display:none}
+  .screen .wrap{padding:0 16px}
+
+  /* ===== Tab bar ===== */
+  .tabbar{
+    flex:0 0 auto;z-index:70;position:relative;
+    height:calc(var(--tabh) + var(--safe-b));padding-bottom:var(--safe-b);
+    background:var(--barbg);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+    box-shadow:0 -.5px 0 var(--sep);
+  }
+  .tabbar .wrap{display:flex;height:var(--tabh)}
+  .tabbtn{flex:1;background:none;border:none;display:flex;flex-direction:column;align-items:center;justify-content:center;
+          gap:2px;color:var(--txt3);cursor:pointer;font-size:10px;font-weight:500;letter-spacing:.05px;
+          transition:color .2s;padding:0;font-family:inherit}
+  .tabbtn svg{width:26px;height:26px;transition:transform .3s cubic-bezier(.34,1.5,.64,1)}
+  .tabbtn:active svg{transform:scale(.88)}
+  .tabbtn.on svg{transform:scale(1.02)}
+
+  /* ===== Cards: flat iOS inset-grouped, no strokes ===== */
+  .card{background:var(--card);border-radius:12px;overflow:hidden}
+  .card.big{border-radius:16px}
+  .pad{padding:16px}
+  .sec{margin-bottom:26px}
+  .sechead{display:flex;align-items:flex-end;justify-content:space-between;margin:0 4px 9px;gap:10px}
+  .sechead h2{margin:0;font-size:20px;font-weight:700;letter-spacing:-.45px}
+  .sechead button{background:none;border:none;color:var(--inr);font-size:15px;font-weight:400;cursor:pointer;
+                  padding:0;font-family:inherit;transition:opacity .15s}
+  .sechead button:active{opacity:.4}
+
+  /* ===== Total hero ===== */
+  .total{border-radius:18px;padding:18px;color:#fff;position:relative;overflow:hidden;cursor:pointer;
+         transition:transform .25s cubic-bezier(.34,1.3,.64,1);animation:rise .55s cubic-bezier(.2,.85,.3,1) backwards}
+  .total:active{transform:scale(.975)}
+  .total.inr{background:linear-gradient(135deg,#3D68FF,#1B3FCC)}
+  .total.mvr{background:linear-gradient(135deg,#0CBBA0,#00806C)}
+  @keyframes rise{from{opacity:0;transform:translateY(16px) scale(.98)}to{opacity:1;transform:none}}
+  .total .top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
+  .total .who{display:flex;gap:9px;align-items:center}
+  .total .who .flag{font-size:21px;line-height:1}
+  .total .who b{font-size:15px;font-weight:600;display:block;letter-spacing:-.2px}
+  .total .who span{font-size:11.5px;opacity:.72;display:block;margin-top:1px}
+  .total .amt{font-size:36px;font-weight:700;letter-spacing:-1.3px;font-variant-numeric:tabular-nums;line-height:1.05;
+              font-family:-apple-system,"SF Pro Display",sans-serif}
+  .total .stats{display:flex;gap:20px;align-items:center;margin-top:14px;font-size:12px}
+  .total .stats .s{display:flex;gap:6px;align-items:center}
+  .total .stats .s i{font-style:normal;opacity:.72;font-size:9.5px;display:block;text-transform:uppercase;letter-spacing:.5px}
+  .total .stats .s b{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+  .total .pill{background:rgba(255,255,255,.2);border-radius:20px;padding:3px 9px;font-size:10.5px;font-weight:600}
+  .segnote{display:flex;gap:6px;align-items:flex-start;justify-content:center;color:var(--txt4);
+           font-size:12px;margin-top:14px;padding:0 12px;text-align:center;line-height:1.35}
+
+  /* ===== Quick actions ===== */
+  .quick{display:flex;gap:6px;margin:0 0 26px}
+  .qa{flex:1;background:none;border:none;display:flex;flex-direction:column;align-items:center;gap:7px;cursor:pointer;
+      font-size:11.5px;color:var(--txt);font-weight:400;transition:transform .2s cubic-bezier(.34,1.4,.64,1);
+      font-family:inherit;padding:0}
+  .qa:active{transform:scale(.9)}
+  .qa .ic{width:52px;height:52px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:21px}
+
+  /* ===== Mini cards ===== */
+  .minis{display:flex;gap:12px}
+  .mini{flex:1;padding:14px;cursor:pointer;transition:transform .2s}
+  .mini:active{transform:scale(.98)}
+  .mini .v{font-size:19px;font-weight:700;letter-spacing:-.5px;font-variant-numeric:tabular-nums;margin:8px 0 1px}
+  .mini .l{font-size:11.5px;color:var(--txt3)}
+  .spark{height:44px;margin-top:10px;display:block}
+
+  /* ===== Badges ===== */
+  .badge{display:inline-flex;gap:4px;align-items:center;border-radius:20px;padding:2.5px 8px;
+         font-size:10.5px;font-weight:600;letter-spacing:.2px;white-space:nowrap}
+  .badge.inr{background:rgba(46,91,255,.14);color:var(--inr)}
+  .badge.mvr{background:rgba(0,168,142,.16);color:#00907a}
+  :root[data-theme="dark"] .badge.mvr{color:#2AD4B8}
+  :root[data-theme="dark"] .badge.inr{background:rgba(46,91,255,.22);color:#7B9BFF}
+
+  /* ===== Rows ===== */
+  .row{display:flex;align-items:center;gap:12px;padding:10px 16px;cursor:pointer;
+       transition:background .12s;position:relative;background:var(--card)}
+  .row:active{background:var(--fill)}
+  .row+.row::before{content:'';position:absolute;top:0;left:60px;right:0;height:.5px;background:var(--sep)}
+  .row .ic{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+           font-size:17px;flex:0 0 38px}
+  .row .mid{flex:1;min-width:0}
+  .row .mid b{display:block;font-size:16px;font-weight:400;letter-spacing:-.3px;
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .mid span{font-size:12.5px;color:var(--txt3);letter-spacing:-.05px}
+  .row .rt{text-align:right;flex:0 0 auto}
+  .row .rt b{display:block;font-size:16px;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+  .row .rt b.cr{color:var(--green)}
+  .chev{color:var(--txt4);font-size:17px;font-weight:300;margin-left:2px}
+
+  /* ===== Account card ===== */
+  .acct{display:flex;align-items:center;gap:13px;padding:12px 14px;margin-bottom:10px;cursor:pointer;
+        transition:transform .2s cubic-bezier(.34,1.3,.64,1)}
+  .acct:active{transform:scale(.978)}
+  .acct .ic{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+            font-size:20px;color:#fff;flex:0 0 46px}
+  .acct .mid{flex:1;min-width:0}
+  .acct .mid .nm{display:flex;gap:7px;align-items:center;margin-bottom:2px}
+  .acct .mid .nm b{font-size:16px;font-weight:500;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .acct .mid span{font-size:12.5px;color:var(--txt3);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .acct .bal{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums;text-align:right;letter-spacing:-.3px}
+  .acct .bal.neg{color:var(--red)}
+
+  .addcard{background:var(--card2);border-radius:12px;padding:15px;display:flex;gap:13px;align-items:center;
+           cursor:pointer;transition:transform .2s,background .15s}
+  .addcard:active{transform:scale(.98);background:var(--fill)}
+  .addcard .plus{width:40px;height:40px;border-radius:50%;background:var(--fill);display:flex;align-items:center;
+                 justify-content:center;font-size:22px;color:var(--txt3);flex:0 0 40px;font-weight:300}
+  .addcard .t{font-size:15.5px;font-weight:400;letter-spacing:-.2px}
+  .addcard .s{font-size:13px;color:var(--inr);margin-top:1px}
+
+  /* ===== Empty state ===== */
+  .empty{text-align:center;padding:52px 24px;animation:rise .5s cubic-bezier(.2,.85,.3,1)}
+  .empty .g{font-size:52px;opacity:.28;margin-bottom:14px;line-height:1}
+  .empty h3{margin:0 0 7px;font-size:19px;font-weight:600;letter-spacing:-.4px}
+  .empty p{margin:0 auto;font-size:15px;color:var(--txt3);max-width:290px;line-height:1.42;letter-spacing:-.2px}
+  .empty .btn{margin-top:20px}
+
+  /* ===== Buttons ===== */
+  .btn{background:var(--inr);color:#fff;border:none;border-radius:14px;padding:15px 24px;font-size:17px;
+       font-weight:600;cursor:pointer;transition:transform .16s,opacity .16s;font-family:inherit;letter-spacing:-.3px}
+  .btn:active{transform:scale(.965);opacity:.9}
+  .btn:disabled{opacity:.32;cursor:default;transform:none}
+  .btn.wide{width:100%}
+  .btn.sec2{background:var(--fill);color:var(--inr)}
+  .btn.danger{background:var(--red)}
+  .btn.mvr{background:var(--mvr)}
+  .btn.plain{background:none;color:var(--red);font-weight:400}
+
+  /* ===== Segmented ===== */
+  .seg{display:flex;background:var(--fill);border-radius:9px;padding:2px;position:relative}
+  .seg button{flex:1;background:none;border:none;padding:7px 6px;font-size:13px;font-weight:500;border-radius:7px;
+              cursor:pointer;color:var(--txt);transition:all .25s cubic-bezier(.3,1,.4,1);font-family:inherit;
+              letter-spacing:-.1px;white-space:nowrap}
+  .seg button.on{background:var(--card);box-shadow:0 3px 8px rgba(0,0,0,.12),0 1px 1px rgba(0,0,0,.04);font-weight:600}
+  :root[data-theme="dark"] .seg button.on{background:#636366;box-shadow:none}
+  .seg button:disabled{opacity:.4;cursor:default}
+
+  /* ===== Forms: iOS inset grouped ===== */
+  .group{background:var(--card);border-radius:12px;overflow:hidden;margin-bottom:8px}
+  .field{background:var(--card);padding:12px 16px;display:flex;align-items:center;gap:12px;min-height:46px;position:relative}
+  .field+.field::before{content:'';position:absolute;top:0;left:16px;right:0;height:.5px;background:var(--sep)}
+  .field.tap{cursor:pointer;transition:background .12s}
+  .field.tap:active{background:var(--fill)}
+  .field label{font-size:16px;flex:0 0 auto;color:var(--txt);letter-spacing:-.3px}
+  .field input,.field select{flex:1;border:none;background:none;font-size:16px;font-family:inherit;text-align:right;
+                             outline:none;color:var(--txt);min-width:0;letter-spacing:-.3px;padding:0;appearance:none}
+  .field select{text-align-last:right;color:var(--txt3);cursor:pointer}
+  .field input::placeholder{color:var(--txt4)}
+  .grouphead{font-size:13px;color:var(--txt3);text-transform:uppercase;letter-spacing:.4px;
+             margin:26px 16px 7px;font-weight:400}
+  .groupfoot{font-size:13px;color:var(--txt3);margin:7px 16px 0;line-height:1.35;letter-spacing:-.1px}
+  .err{display:flex;gap:6px;align-items:flex-start;color:var(--red);font-size:13px;margin:7px 16px 0;
+       animation:shake .4s cubic-bezier(.36,.07,.19,.97);line-height:1.35}
+  @keyframes shake{0%,100%{transform:translateX(0)}20%{transform:translateX(-5px)}40%{transform:translateX(5px)}60%{transform:translateX(-3px)}80%{transform:translateX(3px)}}
+
+  .amountbox{background:var(--card);border-radius:14px;padding:18px}
+  .amountrow{display:flex;align-items:baseline;gap:9px}
+  .amountrow .sym{font-size:28px;font-weight:600;color:var(--txt3);letter-spacing:-.8px}
+  .amountrow input{flex:1;border:none;background:none;font-size:46px;font-weight:700;letter-spacing:-2px;
+                   outline:none;font-family:-apple-system,"SF Pro Display",sans-serif;width:100%;min-width:0;
+                   color:var(--txt);padding:0;font-variant-numeric:tabular-nums}
+  .amountrow input::placeholder{color:var(--txt4)}
+
+  /* ===== Category chips ===== */
+  .cats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+  .cat{background:none;border:none;display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 2px;
+       border-radius:12px;cursor:pointer;transition:all .22s cubic-bezier(.34,1.4,.64,1);font-family:inherit}
+  .cat .ic{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+           font-size:17px;transition:all .22s}
+  .cat span{font-size:11px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;
+            letter-spacing:-.1px}
+  .cat:active{transform:scale(.92)}
+  .cat.on{transform:scale(1.04)}
+  .cat.on span{font-weight:600}
+
+  .chips{display:flex;gap:8px;overflow-x:auto;padding:2px 16px 8px;margin:0 -16px 14px;scrollbar-width:none}
+  .chips::-webkit-scrollbar{height:0;display:none}
+  .chip{flex:0 0 auto;border:none;border-radius:20px;padding:9px 14px;font-size:13.5px;font-weight:500;
+        cursor:pointer;display:flex;gap:5px;align-items:center;transition:all .2s;font-family:inherit;letter-spacing:-.1px}
+  .chip:active{transform:scale(.94)}
+
+  /* ===== Toggle ===== */
+  .toggle{width:51px;height:31px;border-radius:16px;background:var(--fill);position:relative;
+          cursor:pointer;transition:background .3s cubic-bezier(.3,1,.4,1);flex:0 0 51px}
+  .toggle.on{background:var(--green)}
+  .toggle i{position:absolute;top:2px;left:2px;width:27px;height:27px;border-radius:50%;background:#fff;
+            box-shadow:0 3px 8px rgba(0,0,0,.15),0 1px 1px rgba(0,0,0,.06);
+            transition:transform .3s cubic-bezier(.34,1.4,.64,1)}
+  .toggle.on i{transform:translateX(20px)}
+
+  /* ===== Gauge ===== */
+  .gauge{display:flex;flex-direction:column;align-items:center;padding:26px 16px}
+  .gwrap{position:relative;width:200px;height:200px}
+  .gwrap svg{transform:rotate(-90deg);display:block}
+  .gcenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}
+  .gcenter .l{font-size:13px;color:var(--txt3)}
+  .gcenter .v{font-size:28px;font-weight:700;letter-spacing:-.9px;font-variant-numeric:tabular-nums;
+              font-family:-apple-system,"SF Pro Display",sans-serif}
+  .gcenter .v.neg{color:var(--red)}
+  .gstats{display:flex;gap:20px;align-items:center;margin-top:18px}
+  .gstats .s{text-align:center}
+  .gstats .s i{font-style:normal;display:block;font-size:12px;color:var(--txt3);margin-bottom:3px}
+  .gstats .s b{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+  .gstats .div{width:.5px;height:28px;background:var(--sep)}
+
+  /* ===== Charts ===== */
+  .barchart{display:flex;align-items:flex-end;gap:10px;height:152px;padding:0 2px;margin-top:10px}
+  .barcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:7px;cursor:pointer}
+  .bar{width:100%;max-width:32px;border-radius:6px;transition:height .75s cubic-bezier(.2,.9,.3,1),opacity .25s;min-height:4px}
+  .barcol .lb{font-size:11px;color:var(--txt3)}
+  .barcol.on .lb{font-weight:700;color:var(--txt)}
+
+  .donutwrap{position:relative;display:flex;justify-content:center;padding:10px 0 6px}
+  .donutcenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+               gap:3px;pointer-events:none}
+  .donutcenter .l{font-size:13px;color:var(--txt3)}
+  .donutcenter .v{font-size:23px;font-weight:700;letter-spacing:-.6px;font-variant-numeric:tabular-nums}
+  .donutcenter .p{font-size:12px;color:var(--txt3)}
+  .slice{cursor:pointer;transition:opacity .25s,d .3s}
+
+  .catbar{padding:12px 16px;cursor:pointer;transition:background .15s;position:relative;background:var(--card)}
+  .catbar:active{background:var(--fill)}
+  .catbar+.catbar::before{content:'';position:absolute;top:0;left:16px;right:0;height:.5px;background:var(--sep)}
+  .catbar .t{display:flex;align-items:center;gap:13px}
+  .catbar .ic{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+              font-size:15px;flex:0 0 36px}
+  .catbar .info{flex:1;min-width:0}
+  .catbar .l1{display:flex;justify-content:space-between;font-size:15.5px;margin-bottom:6px;letter-spacing:-.3px}
+  .catbar .l1 b{font-weight:600;font-variant-numeric:tabular-nums}
+  .track{height:6px;border-radius:3px;background:var(--fill);overflow:hidden}
+  .track i{display:block;height:100%;border-radius:3px;transition:width .85s cubic-bezier(.2,.9,.3,1)}
+  .catbar .l2{display:flex;justify-content:space-between;font-size:11.5px;color:var(--txt3);margin-top:5px}
+
+  .summaries{display:flex;gap:10px;margin-bottom:18px}
+  .sm{flex:1;padding:13px}
+  .sm .h{display:flex;gap:4px;align-items:center;font-size:11.5px;font-weight:600;margin-bottom:6px;letter-spacing:-.1px}
+  .sm .v{font-size:17px;font-weight:700;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
+
+  .monthbar{display:flex;align-items:center;justify-content:space-between;padding:11px 12px;margin-bottom:18px}
+  .monthbar button{background:none;border:none;color:var(--inr);font-size:20px;cursor:pointer;padding:4px 14px;
+                   font-family:inherit;font-weight:300;transition:opacity .15s}
+  .monthbar button:active{opacity:.4}
+  .monthbar button:disabled{color:var(--txt4);cursor:default}
+  .monthbar .m{font-size:17px;font-weight:600;letter-spacing:-.4px}
+
+  /* ===== Sheet ===== */
+  .backdrop{position:absolute;inset:0;background:rgba(0,0,0,.4);z-index:90;opacity:0;pointer-events:none;
+            transition:opacity .35s ease;backdrop-filter:blur(0px)}
+  .backdrop.on{opacity:1;pointer-events:auto}
+  .sheet{position:absolute;left:0;right:0;bottom:0;background:var(--sheetbg);border-radius:12px 12px 0 0;z-index:95;
+         transform:translateY(101%);transition:transform .45s cubic-bezier(.32,.94,.28,1);display:flex;flex-direction:column;
+         max-height:calc(100% - var(--safe-t) - 12px);box-shadow:0 -1px 30px rgba(0,0,0,.18)}
+  .sheet.on{transform:translateY(0)}
+  .sheet .grab{width:36px;height:5px;border-radius:3px;background:var(--txt4);margin:6px auto 0;flex:0 0 auto}
+  .sheet .shead{display:flex;align-items:center;justify-content:space-between;padding:12px 16px 10px;flex:0 0 auto;gap:8px}
+  .sheet .shead .t{font-size:17px;font-weight:600;letter-spacing:-.3px;flex:1;text-align:center}
+  .sheet .shead button{background:none;border:none;color:var(--inr);font-size:17px;cursor:pointer;font-family:inherit;
+                       padding:2px 0;min-width:58px;transition:opacity .15s;letter-spacing:-.3px}
+  .sheet .shead button:active{opacity:.4}
+  .sheet .shead button:first-child{text-align:left}
+  .sheet .shead button:last-child{text-align:right}
+  .sheet .shead button.pri{font-weight:600}
+  .sheet .shead button:disabled{color:var(--txt4)}
+  .sheet .sbody{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0 16px calc(var(--safe-b) + 30px);
+                overscroll-behavior-y:contain}
+  .sheet .sbody::-webkit-scrollbar{width:0;display:none}
+  .sheet .sbody > .grouphead:first-child{margin-top:12px}
+
+  /* ===== Toast ===== */
+  .toast{position:absolute;top:calc(var(--safe-t) + 10px);left:12px;right:12px;z-index:120;display:flex;gap:11px;
+         align-items:center;background:var(--card);border-radius:26px;padding:13px 18px;
+         box-shadow:0 10px 34px rgba(0,0,0,.18),0 2px 6px rgba(0,0,0,.08);font-size:15px;font-weight:500;
+         transform:translateY(-130px);opacity:0;transition:all .45s cubic-bezier(.32,1.25,.4,1);pointer-events:none;
+         letter-spacing:-.3px;max-width:660px;margin:0 auto}
+  .toast.on{transform:translateY(0);opacity:1;pointer-events:auto}
+  .toast.ok{color:var(--green)}
+  .toast.warn{color:var(--orange)}
+  .toast.err{color:var(--red)}
+  .toast.info{color:var(--inr)}
+  .toast .msg{flex:1;min-width:0}
+  .toast button{background:none;border:none;color:inherit;font-weight:700;font-size:15px;cursor:pointer;font-family:inherit}
+
+  /* ===== Offline banner ===== */
+  .offline{position:absolute;top:0;left:0;right:0;z-index:110;background:linear-gradient(90deg,#FF9500,#FF7A00);
+           color:#fff;font-size:13px;font-weight:600;display:flex;gap:8px;align-items:center;
+           padding:calc(var(--safe-t) + 9px) 16px 9px;letter-spacing:-.2px;
+           transform:translateY(-100%);transition:transform .4s cubic-bezier(.3,1,.4,1)}
+  .offline.on{transform:translateY(0)}
+  .offline .q{margin-left:auto;background:rgba(255,255,255,.24);border-radius:12px;padding:3px 9px;font-size:11px}
+
+  /* ===== Quick-add FAB (center tab) ===== */
+  .fabslot{flex:0 0 auto;width:64px;display:flex;align-items:flex-start;justify-content:center;position:relative}
+  .fab{width:54px;height:54px;border-radius:50%;border:none;cursor:pointer;position:absolute;top:-19px;
+       background:linear-gradient(140deg,#0CBBA0,#00806C);color:#fff;font-size:29px;font-weight:300;line-height:1;
+       display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit;
+       box-shadow:0 6px 18px rgba(0,168,142,.42),0 2px 5px rgba(0,0,0,.14);
+       transition:transform .34s cubic-bezier(.34,1.5,.5,1),box-shadow .25s}
+  .fab.inrTint{background:linear-gradient(140deg,#4C74FF,#1B3FCC);box-shadow:0 6px 18px rgba(46,91,255,.42),0 2px 5px rgba(0,0,0,.14)}
+  .fab:active{transform:scale(.9)}
+  .fab span{display:block;transition:transform .34s cubic-bezier(.34,1.5,.5,1)}
+  .fab.open span{transform:rotate(135deg)}
+  .fab.open{box-shadow:0 3px 10px rgba(0,0,0,.2)}
+
+  .fabmask{position:absolute;inset:0;z-index:78;opacity:0;pointer-events:none;
+           background:rgba(0,0,0,.28);backdrop-filter:blur(2px);transition:opacity .3s ease}
+  .fabmask.on{opacity:1;pointer-events:auto}
+
+  .fabmenu{position:absolute;left:0;right:0;bottom:calc(var(--tabh) + var(--safe-b) + 14px);z-index:80;
+           display:flex;flex-direction:column;align-items:center;gap:11px;pointer-events:none;padding:0 16px}
+  .fabmenu.on{pointer-events:auto}
+  .fabitem{display:flex;align-items:center;gap:13px;background:var(--card);border:none;cursor:pointer;
+           border-radius:16px;padding:13px 18px 13px 14px;width:100%;max-width:330px;font-family:inherit;
+           box-shadow:0 8px 26px rgba(0,0,0,.16);opacity:0;transform:translateY(22px) scale(.92);
+           transition:opacity .3s cubic-bezier(.2,.9,.3,1),transform .34s cubic-bezier(.32,1.35,.5,1),background .12s}
+  .fabmenu.on .fabitem{opacity:1;transform:none}
+  .fabitem:active{background:var(--fill)}
+  .fabitem .ic{width:42px;height:42px;border-radius:13px;display:flex;align-items:center;justify-content:center;
+               font-size:19px;flex:0 0 42px;color:#fff}
+  .fabitem .tx{text-align:left;flex:1;min-width:0}
+  .fabitem .tx b{display:block;font-size:16px;font-weight:600;color:var(--txt);letter-spacing:-.3px}
+  .fabitem .tx span{display:block;font-size:12.5px;color:var(--txt3);margin-top:1px}
+
+  /* ===== Recurring ===== */
+  .recrow{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;position:relative;background:var(--card)}
+  .recrow:active{background:var(--fill)}
+  .recrow+.recrow::before{content:'';position:absolute;top:0;left:60px;right:0;height:.5px;background:var(--sep)}
+  .recrow .ic{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;
+              font-size:17px;flex:0 0 38px}
+  .recrow .mid{flex:1;min-width:0}
+  .recrow .mid b{display:block;font-size:16px;font-weight:500;letter-spacing:-.3px;
+                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .recrow .mid span{font-size:12.5px;color:var(--txt3);display:block;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .recrow .amt{display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex:0 0 auto}
+  .recrow.off{opacity:.45}
+  .duepill{font-size:10.5px;font-weight:700;padding:2.5px 8px;border-radius:20px;letter-spacing:.2px;
+           background:rgba(255,149,0,.16);color:#B36A00;white-space:nowrap}
+  :root[data-theme="dark"] .duepill{color:#FFB340}
+  .duepill.soon{background:rgba(52,199,89,.16);color:#1F8B3C}
+  :root[data-theme="dark"] .duepill.soon{color:#4ADE6A}
+
+  .dayscroll{display:flex;gap:7px;overflow-x:auto;padding:4px 16px 10px;margin:0 -16px;scrollbar-width:none}
+  .dayscroll::-webkit-scrollbar{height:0;display:none}
+  .daybtn{flex:0 0 auto;width:42px;height:42px;border-radius:12px;border:none;cursor:pointer;font-family:inherit;
+          font-size:15px;font-weight:600;background:var(--fill);color:var(--txt);transition:all .2s cubic-bezier(.34,1.4,.64,1)}
+  .daybtn:active{transform:scale(.9)}
+  .daybtn.on{color:#fff;transform:scale(1.06)}
+
+  /* ===== Transfer visual ===== */
+  .tvis{display:flex;align-items:center;gap:10px;padding:16px 14px}
+  .tvis .side{flex:1;min-width:0;text-align:center}
+  .tvis .side .lb{font-size:11px;color:var(--txt3);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px}
+  .tvis .side .ic{width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+                  font-size:20px;color:#fff;margin:0 auto 7px}
+  .tvis .side .nm{font-size:14px;font-weight:600;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tvis .side .am{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:4px;letter-spacing:-.3px}
+  .tvis .arrow{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:3px;color:var(--txt4)}
+  .tvis .arrow .a{font-size:22px;line-height:1}
+  .tvis .arrow .r{font-size:9.5px;font-weight:700;color:var(--orange);white-space:nowrap}
+  .swapbtn{width:34px;height:34px;border-radius:50%;border:none;background:var(--fill);color:var(--txt3);
+           font-size:16px;cursor:pointer;font-family:inherit;transition:transform .3s cubic-bezier(.34,1.5,.5,1)}
+  .swapbtn:active{transform:rotate(180deg) scale(.9)}
+
+  /* ===== Appearance preview tiles ===== */
+  .themepreview{display:flex;gap:14px;margin-top:14px}
+  .tp{flex:1;border-radius:14px;padding:11px;cursor:pointer;position:relative;
+      transition:transform .22s cubic-bezier(.34,1.4,.64,1),box-shadow .22s;
+      display:flex;flex-direction:column;gap:7px}
+  .tp:active{transform:scale(.96)}
+  .tp.light{background:#F2F2F7}
+  .tp.dark{background:#000}
+  .tp.on{box-shadow:0 0 0 2.5px var(--bg),0 0 0 5px var(--inr)}
+  .tpchrome{display:flex;align-items:center;gap:5px;margin-bottom:1px}
+  .tpdot{width:13px;height:13px;border-radius:50%;flex:0 0 13px}
+  .tp.light .tpdot{background:linear-gradient(135deg,#0CBBA0,#00806C)}
+  .tp.dark .tpdot{background:linear-gradient(135deg,#0CBBA0,#00806C)}
+  .tpbar{height:6px;border-radius:3px;flex:1}
+  .tp.light .tpbar{background:rgba(60,60,67,.22)}
+  .tp.dark .tpbar{background:rgba(235,235,245,.3)}
+  .tpcard{border-radius:7px;padding:7px 8px;display:flex;flex-direction:column;gap:4px}
+  .tp.light .tpcard{background:#FFF}
+  .tp.dark .tpcard{background:#1C1C1E}
+  .tpline{height:5px;border-radius:3px;display:block}
+  .tp.light .tpline{background:rgba(60,60,67,.18)}
+  .tp.dark .tpline{background:rgba(235,235,245,.24)}
+  .w40{width:40%}.w45{width:45%}.w60{width:60%}.w70{width:70%}
+  .tplabel{font-size:12px;font-weight:600;text-align:center;margin-top:2px;letter-spacing:-.1px}
+  .tp.light .tplabel{color:#000}
+  .tp.dark .tplabel{color:#fff}
+
+  /* ===== Sync pill ===== */
+  .syncpill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
+            padding:3px 9px;border-radius:20px;letter-spacing:-.1px;white-space:nowrap;
+            background:var(--fill);color:var(--txt3);transition:all .3s}
+  .syncpill .dot{width:6px;height:6px;border-radius:50%;background:currentColor;display:block}
+  .syncpill.ok{background:rgba(52,199,89,.15);color:#1F8B3C}
+  .syncpill.live{background:rgba(46,91,255,.15);color:var(--inr)}
+  .syncpill.live .dot{animation:pulse 1.6s ease-in-out infinite}
+  .syncpill.off{background:rgba(255,149,0,.16);color:#B36A00}
+  :root[data-theme="dark"] .syncpill.ok{color:#4ADE6A}
+  :root[data-theme="dark"] .syncpill.live{color:#7B9BFF}
+  :root[data-theme="dark"] .syncpill.off{color:#FFB340}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.75)}}
+
+  /* ===== Budgets ===== */
+  .bud{padding:12px 16px;position:relative;cursor:pointer;background:var(--card);transition:background .12s}
+  .bud:active{background:var(--fill)}
+  .bud+.bud::before{content:'';position:absolute;top:0;left:16px;right:0;height:.5px;background:var(--sep)}
+  .bud .top{display:flex;align-items:center;gap:11px}
+  .bud .ic{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+           font-size:15px;flex:0 0 34px}
+  .bud .nm{flex:1;min-width:0}
+  .bud .nm b{display:block;font-size:15.5px;font-weight:500;letter-spacing:-.3px;
+             white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bud .nm span{font-size:12px;color:var(--txt3);display:block;margin-top:1px}
+  .bud .amt{text-align:right;flex:0 0 auto}
+  .bud .amt b{display:block;font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+  .bud .amt i{font-style:normal;font-size:11.5px;color:var(--txt3)}
+  .bud .track{margin-top:9px;height:7px}
+  .bud.over .track i{background:var(--red)!important}
+  .bud .amt b.over{color:var(--red)}
+  .bud .amt b.near{color:var(--orange)}
+  .limitchip{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:20px;letter-spacing:.2px;
+             background:rgba(52,199,89,.16);color:#1F8B3C;white-space:nowrap}
+  .limitchip.near{background:rgba(255,149,0,.16);color:#B36A00}
+  .limitchip.over{background:rgba(255,59,48,.16);color:#C4271E}
+  :root[data-theme="dark"] .limitchip{color:#4ADE6A}
+  :root[data-theme="dark"] .limitchip.near{color:#FFB340}
+  :root[data-theme="dark"] .limitchip.over{color:#FF6B60}
+
+  /* budget mark: dotted limit line inside a report bar */
+  .track.lim{overflow:visible;position:relative}
+  .track.lim em{position:absolute;top:-2px;bottom:-2px;width:2px;border-radius:2px;
+                background:var(--txt3);opacity:.55;display:block}
+
+  /* badge on quick actions / nav */
+  .qab{position:relative}
+  .qab .dotb{position:absolute;top:-2px;right:calc(50% - 26px);min-width:17px;height:17px;border-radius:9px;
+             background:var(--red);color:#fff;font-size:10.5px;font-weight:700;display:flex;align-items:center;
+             justify-content:center;padding:0 4px;box-shadow:0 0 0 2px var(--bg);font-style:normal}
+
+  /* alerts */
+  .alertrow{display:flex;gap:11px;align-items:flex-start;padding:12px 16px;position:relative;background:var(--card)}
+  .alertrow+.alertrow::before{content:'';position:absolute;top:0;left:16px;right:0;height:.5px;background:var(--sep)}
+  .alertrow .ic{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+                font-size:16px;flex:0 0 34px;background:rgba(255,59,48,.14)}
+  .alertrow.warn .ic{background:rgba(255,149,0,.16)}
+  .alertrow .mid{flex:1;min-width:0}
+  .alertrow .mid b{display:block;font-size:15px;font-weight:600;letter-spacing:-.3px}
+  .alertrow .mid span{display:block;font-size:12.5px;color:var(--txt3);margin-top:2px;line-height:1.35}
+  .alertrow.unread{background:rgba(46,91,255,.05)}
+  :root[data-theme="dark"] .alertrow.unread{background:rgba(46,91,255,.12)}
+
+  /* note chips inside the txn sheet */
+  .quicknotes{display:flex;gap:7px;overflow-x:auto;padding:8px 16px 2px;margin:0 -16px;scrollbar-width:none}
+  .quicknotes::-webkit-scrollbar{height:0;display:none}
+  .qn{flex:0 0 auto;border:none;border-radius:20px;padding:7px 12px;font-size:12.5px;font-weight:500;
+      background:var(--fill);color:var(--txt2);cursor:pointer;font-family:inherit;letter-spacing:-.1px;
+      transition:transform .18s,background .15s;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .qn:active{transform:scale(.94)}
+
+  /* inline budget preview under the amount */
+  .budprev{display:flex;gap:8px;align-items:center;margin:10px 16px 0;font-size:12.5px;color:var(--txt3)}
+  .budprev .track{flex:1;height:5px}
+  .budprev b{font-weight:600;font-variant-numeric:tabular-nums;color:var(--txt2)}
+
+  /* setup steps */
+  .steps{counter-reset:st;margin:0;padding:0;list-style:none}
+  .steps li{position:relative;padding:11px 16px 11px 46px;font-size:14.5px;color:var(--txt2);
+            line-height:1.4;letter-spacing:-.2px;background:var(--card)}
+  .steps li+li::before{content:'';position:absolute;top:0;left:46px;right:0;height:.5px;background:var(--sep)}
+  .steps li em{position:absolute;left:16px;top:11px;width:20px;height:20px;border-radius:50%;
+               background:var(--fill);color:var(--txt2);font-style:normal;font-size:11.5px;font-weight:700;
+               display:flex;align-items:center;justify-content:center}
+  .steps li b{font-weight:600;color:var(--txt)}
+  .linkbox{background:var(--card);border-radius:12px;padding:13px 16px;display:flex;gap:10px;align-items:center}
+  .linkbox code{flex:1;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;
+                color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .linkbox button{background:none;border:none;color:var(--inr);font-size:14px;font-weight:600;cursor:pointer;
+                  font-family:inherit;white-space:nowrap;padding:2px}
+
+  /* ===== Notes ===== */
+  .note{display:flex;gap:8px;padding:12px 14px;background:var(--card2);border-radius:11px;
+        font-size:13px;color:var(--txt3);line-height:1.4;letter-spacing:-.1px}
+  .note.warn{background:rgba(255,149,0,.14);color:#B36A00}
+  .note.blue{background:rgba(46,91,255,.1);color:#2B52C8}
+  :root[data-theme="dark"] .note.warn{color:#FFB340}
+  :root[data-theme="dark"] .note.blue{color:#7B9BFF}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div class="offline" id="offlineBanner">
+    <span>⚠</span><span>You're offline — changes saved on this device</span>
+    <span class="q" id="queueCount">0 queued</span>
+  </div>
+
+  <div class="navbar" id="navbar"><div class="row wrap" id="navrow"></div></div>
+  <div class="screen" id="screen"><div class="wrap" id="screenwrap"></div></div>
+
+  <div class="toast" id="toast"><span id="toastIcon">✓</span><span class="msg" id="toastMsg"></span><span id="toastAction"></span></div>
+
+  <div class="fabmask" id="fabmask" onclick="closeFab()"></div>
+  <div class="fabmenu" id="fabmenu"></div>
+
+  <div class="backdrop" id="backdrop" onclick="closeSheet()"></div>
+  <div class="sheet" id="sheet">
+    <div class="grab"></div>
+    <div class="shead" id="sheetHead"></div>
+    <div class="sbody" id="sheetBody"></div>
+  </div>
+
+  <div class="tabbar" id="tabbar"><div class="wrap" id="tabwrap"></div></div>
+</div>
+
+<script>
+/* ============ STATE ============ */
+const uid = () => 'x'+Math.random().toString(36).slice(2,10);
+
+const CUR = {
+  INR:{code:'INR',sym:'₹',flag:'🇮🇳',name:'Indian Rupee',color:'#2E5BFF',cls:'inr'},
+  MVR:{code:'MVR',sym:'Rf',flag:'🇲🇻',name:'Maldivian Rufiyaa',color:'#00A88E',cls:'mvr'}
+};
+
+const CATS = [
+  {id:'c1',name:'Groceries',icon:'🛒',color:'#34C759',flow:'expense'},
+  {id:'c2',name:'Dining',icon:'🍽️',color:'#FF9500',flow:'expense'},
+  {id:'c3',name:'Transport',icon:'🚗',color:'#5AC8FA',flow:'expense'},
+  {id:'c4',name:'Bills',icon:'⚡',color:'#FFCC00',flow:'expense'},
+  {id:'c5',name:'Rent',icon:'🏠',color:'#AF52DE',flow:'expense'},
+  {id:'c6',name:'Shopping',icon:'🛍️',color:'#FF2D55',flow:'expense'},
+  {id:'c7',name:'Health',icon:'💊',color:'#FF3B30',flow:'expense'},
+  {id:'c8',name:'Travel',icon:'✈️',color:'#007AFF',flow:'expense'},
+  {id:'c9',name:'Salary',icon:'💰',color:'#30D158',flow:'income'},
+  {id:'c10',name:'Other',icon:'⋯',color:'#8E8E93',flow:'both'},
+  {id:'c11',name:'Transfer',icon:'⇄',color:'#8E8E93',flow:'both',system:true}
+];
+
+const KINDS={bank:{l:'Bank',i:'🏦'},savings:{l:'Savings',i:'📈'},card:{l:'Card',i:'💳'},wallet:{l:'Wallet',i:'👛'},cash:{l:'Cash',i:'💵'}};
+const bankLike = k => k==='bank'||k==='savings'||k==='card';
+
+let S={};
+function seed(){
+  const A=(name,inst,kind,cur,open,mask,color)=>({id:uid(),name,inst,kind,currency:cur,opening:open,mask,color,include:true,archived:false});
+  const a=[
+    A('HDFC Savings','HDFC Bank','bank','INR',1845000,'4821','#2E5BFF'),
+    A('SBI Salary','State Bank of India','savings','INR',9230000,'1190','#0B7285'),
+    A('Paytm','Paytm Payments','wallet','INR',214000,null,'#00B8D9'),
+    A('BML Current','Bank of Maldives','bank','MVR',2480000,'7745','#C0392B'),
+    A('MIB Savings','Maldives Islamic Bank','savings','MVR',6120000,'3302','#1E8E3E'),
+    A('m-Faisaa','Ooredoo','wallet','MVR',187500,null,'#E8590C')
+  ];
+  const d=n=>{const x=new Date();x.setDate(x.getDate()-n);return x.toISOString()};
+  const T=(ai,cur,amt,dir,cat,merch,days)=>({id:uid(),accountId:a[ai].id,currency:cur,amount:amt,dir,categoryId:cat,merchant:merch,at:d(days),sync:'synced',fx:null});
+  const t=[
+    T(3,'MVR',38500,'debit','c1','Agora Supermarket',1),
+    T(3,'MVR',12000,'debit','c3','Ferry Terminal',2),
+    T(5,'MVR',45000,'debit','c4','Ooredoo Top-up',3),
+    T(4,'MVR',240000,'debit','c5','Monthly rent',5),
+    T(0,'INR',129900,'debit','c6','Amazon',2),
+    T(0,'INR',64000,'debit','c2','Cafe Coffee Day',4),
+    T(2,'INR',22000,'debit','c3','Uber',6),
+    T(1,'INR',450000,'debit','c4','Electricity',8),
+    T(3,'MVR',78000,'debit','c2','Seagull Cafe',9),
+    T(0,'INR',210000,'debit','c7','Pharmacy',11),
+    T(1,'INR',8500000,'credit','c9','Monthly salary',12),
+    T(3,'MVR',3200000,'credit','c9','Consulting',14),
+    T(4,'MVR',95000,'debit','c1','Redwave',18),
+    T(0,'INR',340000,'debit','c8','IndiGo',22),
+    T(3,'MVR',56000,'debit','c2','Dinner',40),
+    T(0,'INR',180000,'debit','c6','Myntra',45),
+    T(3,'MVR',310000,'debit','c5','Rent Jul',48),
+    T(0,'INR',520000,'debit','c4','Broadband',72),
+    T(3,'MVR',220000,'debit','c1','Groceries Jun',75),
+    T(0,'INR',260000,'debit','c2','Restaurant',100),
+    T(3,'MVR',180000,'debit','c3','Taxi May',105),
+    T(0,'INR',410000,'debit','c6','Electronics',135)
+  ];
+  S={accounts:a,txns:t.sort((x,y)=>new Date(y.at)-new Date(x.at)),
+     rates:[{base:'INR',quote:'MVR',rate:0.184,pinned:true,at:new Date().toISOString()}],
+     recurring:[
+       {id:uid(),name:'Monthly rent',accountId:a[4].id,currency:'MVR',amount:240000,dir:'debit',
+        categoryId:'c5',day:1,active:true,lastRun:null,created:new Date().toISOString()},
+       {id:uid(),name:'Salary',accountId:a[1].id,currency:'INR',amount:8500000,dir:'credit',
+        categoryId:'c9',day:28,active:true,lastRun:null,created:new Date().toISOString()},
+       {id:uid(),name:'Ooredoo plan',accountId:a[5].id,currency:'MVR',amount:45000,dir:'debit',
+        categoryId:'c4',day:3,active:true,lastRun:null,created:new Date().toISOString()}
+     ],
+     settings:{primary:'MVR',hints:false,alerts:defaultAlerts()},
+     budgets:[], alerts:[],
+     offline:false,queue:[],
+     ui:{tab:'dashboard',stack:[],reportCur:'MVR',reportMonth:new Date(),slice:null}};
+  // Backdate lastRun so the catch-up engine has nothing to replay on a fresh seed.
+  S.recurring.forEach(r=>{ r.lastRun=lastDueKey(r); });
+}
+/* seed() is called by boot() only when there is no saved or remote state. */
+
+/* ============ MONEY ============ */
+function fmt(minor,cur,opts={}){
+  const c=CUR[cur],neg=minor<0,v=Math.abs(minor)/100;
+  let s=v.toLocaleString(cur==='INR'?'en-IN':'en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  return (neg?'−':(opts.sign&&minor>0?'+':''))+(opts.nosym?'':c.sym+' ')+s;
+}
+function compact(minor,cur){
+  const c=CUR[cur],v=Math.abs(minor)/100,neg=minor<0?'−':'';
+  let u;
+  if(cur==='INR'){ u = v>=1e7?(v/1e7).toFixed(1)+'Cr' : v>=1e5?(v/1e5).toFixed(1)+'L' : v>=1e3?(v/1e3).toFixed(1)+'K' : v.toFixed(0); }
+  else { u = v>=1e6?(v/1e6).toFixed(1)+'M' : v>=1e3?(v/1e3).toFixed(1)+'K' : v.toFixed(0); }
+  return neg+c.sym+' '+u;
+}
+
+/* ============ DERIVED (never merged) ============ */
+const active = () => S.accounts.filter(a=>!a.archived);
+const acctsIn = c => active().filter(a=>a.currency===c).sort((x,y)=>x.name.localeCompare(y.name));
+const banksIn = c => acctsIn(c).filter(a=>bankLike(a.kind));
+const wallets = () => active().filter(a=>!bankLike(a.kind));
+const acct = id => S.accounts.find(a=>a.id===id);
+const cat = id => CATS.find(c=>c.id===id);
+
+function balance(id){
+  const a=acct(id); if(!a) return 0;
+  return a.opening + S.txns.filter(t=>t.accountId===id).reduce((s,t)=>s+(t.dir==='debit'?-t.amount:t.amount),0);
+}
+function sameMonth(iso,d){const x=new Date(iso);return x.getMonth()===d.getMonth()&&x.getFullYear()===d.getFullYear()}
+
+function totals(cur,month=new Date()){
+  const list=acctsIn(cur).filter(a=>a.include), ids=new Set(list.map(a=>a.id));
+  const bal=list.reduce((s,a)=>s+a.opening,0)+S.txns.filter(t=>ids.has(t.accountId)).reduce((s,t)=>s+(t.dir==='debit'?-t.amount:t.amount),0);
+  // Transfers move money, they don't spend or earn it — excluded from flow figures
+  // (but they DO affect `bal`, since each leg really debits/credits its account).
+  const mt=S.txns.filter(t=>ids.has(t.accountId)&&sameMonth(t.at,month)&&!t.transferId);
+  return {currency:cur,balance:bal,count:list.length,
+    spent:mt.filter(t=>t.dir==='debit').reduce((s,t)=>s+t.amount,0),
+    earned:mt.filter(t=>t.dir==='credit').reduce((s,t)=>s+t.amount,0),
+    pending:S.txns.filter(t=>ids.has(t.accountId)&&t.sync!=='synced').length};
+}
+const orderedTotals = () => (S.settings.primary==='INR'?['INR','MVR']:['MVR','INR']).map(c=>totals(c));
+
+function breakdown(cur,month){
+  const ids=new Set(acctsIn(cur).map(a=>a.id));
+  const sp=S.txns.filter(t=>ids.has(t.accountId)&&t.dir==='debit'&&sameMonth(t.at,month)&&!t.transferId);
+  const grand=sp.reduce((s,t)=>s+t.amount,0); if(!grand) return [];
+  const m={};sp.forEach(t=>{m[t.categoryId]=(m[t.categoryId]||0)+t.amount});
+  return Object.entries(m).map(([k,v])=>({cat:cat(k),total:v,share:v/grand,count:sp.filter(t=>t.categoryId===k).length}))
+    .sort((a,b)=>b.total-a.total);
+}
+function trend(cur,n=6){
+  const out=[],now=new Date();
+  for(let i=n-1;i>=0;i--){const d=new Date(now.getFullYear(),now.getMonth()-i,1);out.push({month:d,...totals(cur,d)})}
+  return out;
+}
+function dailySpend(cur,month){
+  const ids=new Set(acctsIn(cur).map(a=>a.id));
+  const days=new Date(month.getFullYear(),month.getMonth()+1,0).getDate(),out=Array(days).fill(0);
+  S.txns.filter(t=>ids.has(t.accountId)&&t.dir==='debit'&&sameMonth(t.at,month)&&!t.transferId)
+    .forEach(t=>{out[new Date(t.at).getDate()-1]+=t.amount});
+  return out;
+}
+
+/* ============ NOTES ON TRANSACTIONS ============ */
+/* A note is free text describing exactly what the money was for — "taxi to
+   Male ferry", "lunch with Ali". It is stored on the transaction itself so it
+   travels with sync, appears in the detail view, and stays searchable. */
+
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,m=>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+/* A few recent notes for the picked category, shown as one-tap chips. */
+function quickNotes(f){
+  const seen=new Set(),out=[];
+  for(const t of S.txns){
+    if(t.categoryId!==f.cat||!t.note) continue;
+    const n=t.note.trim(); if(!n||seen.has(n.toLowerCase())) continue;
+    seen.add(n.toLowerCase()); out.push(n);
+    if(out.length>=5) break;
+  }
+  if(!out.length) return '';
+  return `<div class="quicknotes">${out.map(n=>
+    `<button class="qn" data-n="${esc(n)}" onclick="setNote(this.dataset.n)" title="${esc(n)}">${esc(n)}</button>`).join('')}</div>`;
+}
+function setNote(n){ sheetState.form.note=n; renderSheet(); }
+
+/* Live "how does this land against the category limit" line under the amount. */
+function budPreview(f,p){
+  const a=acct(f.acct); if(!a||!p||!p.minor||f.dir!=='debit') return '';
+  const b=budgetOf(f.cat,a.currency); if(!b) return '';
+  const spent=catSpent(f.cat,a.currency,new Date());
+  const after=spent+p.minor, pct=Math.min(after/b.limit,1)*100;
+  const lvl=budLevel(after,b.limit);
+  const col=lvl==='over'?'var(--red)':lvl==='near'?'var(--orange)':CUR[a.currency].color;
+  const label=lvl==='over'
+    ? `<b style="color:var(--red)">${fmt(after-b.limit,a.currency)} over</b> the ${fmt(b.limit,a.currency)} limit`
+    : `<b>${fmt(b.limit-after,a.currency)}</b> left of ${fmt(b.limit,a.currency)} this month`;
+  return `<div class="budprev"><span style="font-size:13px">🎯</span>${label}
+    <span class="track" style="max-width:110px"><i style="width:${pct}%;background:${col}"></i></span></div>`;
+}
+
+/* ============ CATEGORY BUDGETS ============ */
+/* One monthly limit per category, set in one currency. Because INR and MVR are
+   never merged, a category can hold up to two limits — one per currency — and
+   each is measured only against spending in its own currency.
+   `lastLevel` remembers the alert state already announced this month so the
+   app never nags about the same threshold twice: ok → near (80%) → over (100%). */
+
+function budKey(catId,cur){ return catId+':'+cur; }
+
+function budgetsFor(){ return (S.budgets||[]).filter(b=>b&&b.limit>0); }
+function budgetOf(catId,cur){ return (S.budgets||[]).find(b=>b.categoryId===catId&&b.currency===cur)||null; }
+
+/* Spend in one category, one currency, for a given month. Transfers excluded. */
+function catSpent(catId,cur,month){
+  const ids=new Set(acctsIn(cur).map(a=>a.id));
+  return S.txns.filter(t=>ids.has(t.accountId)&&t.dir==='debit'&&t.categoryId===catId&&
+      sameMonth(t.at,month)&&!t.transferId).reduce((s,t)=>s+t.amount,0);
+}
+
+/* Level for a given spend. 80% = "near", 100%+ = "over", otherwise "ok". */
+function budLevel(spent,limit){
+  if(!limit||limit<=0) return 'ok';
+  if(spent>=limit) return 'over';
+  if(spent>=limit*0.8) return 'near';
+  return 'ok';
+}
+const BUD_RANK={ok:0,near:1,over:2};
+
+/* Full picture for one budget row, for a month. */
+function budgetState(b,month){
+  const spent=catSpent(b.categoryId,b.currency,month);
+  const pct=b.limit>0?spent/b.limit:0;
+  return {b,spent,pct,remaining:b.limit-spent,level:budLevel(spent,b.limit),
+          category:cat(b.categoryId)};
+}
+
+/* All budgets for a currency, richest overspend first, rolled up with totals. */
+function budgetRows(cur,month=new Date()){
+  const rows=budgetsFor().filter(b=>b.currency===cur)
+    .map(b=>budgetState(b,month))
+    .sort((x,y)=>(y.pct-x.pct)||(y.spent-x.spent));
+  const limit=rows.reduce((s,r)=>s+r.b.limit,0);
+  const spent=rows.reduce((s,r)=>s+r.spent,0);
+  return {rows,limit,spent};
+}
+
+/* Status for one threshold change: `over` | `near` | `back`, or null when the
+   level did not move (or moved in the harmless direction). */
+function budTransition(prev,next){
+  if(BUD_RANK[next]>BUD_RANK[prev]) return next==='over'?'over':'near';
+  if(next==='ok'&&prev!=='ok') return 'back';
+  return null;
+}
+
+/* ============ ALERTS ============ */
+/* Persistent, per-device inbox. Budget notifications land here so nothing is
+   missed when the app is closed — the bell badge shows the unread count. */
+
+let _notifSupported = false;
+try{ _notifSupported = ('Notification' in window); }catch(_){}
+
+function osPermission(){
+  try{ return _notifSupported ? Notification.permission : 'unsupported'; }catch(_){ return 'unsupported'; }
+}
+function defaultAlerts(){ return {budgets:true,os:false,lastMonth:null}; }
+function alertsCfg(){
+  if(!S.settings.alerts) S.settings.alerts=defaultAlerts();
+  return S.settings.alerts;
+}
+function unreadAlerts(){ return (S.alerts||[]).filter(a=>!a.read).length; }
+
+function addAlert(a){
+  S.alerts=S.alerts||[];
+  // Collapse repeats of the same kind/category/currency/month into one row.
+  const dup=S.alerts.find(x=>x.kind===a.kind&&x.categoryId===a.categoryId&&
+    x.currency===a.currency&&x.month===a.month);
+  if(dup){
+    Object.assign(dup,{spent:a.spent,limit:a.limit,at:a.at,read:false});
+    return dup;
+  }
+  const rec=Object.assign({id:uid(),read:false,at:new Date().toISOString()},a);
+  S.alerts.unshift(rec);
+  // Keep the inbox bounded — the ledger is the record, this is just a nudge.
+  if(S.alerts.length>120) S.alerts.length=120;
+  return rec;
+}
+
+/* Fire the OS-level notification when the user has opted in and granted it. */
+function pushOS(title,body){
+  if(osPermission()!=='granted'||!alertsCfg().os) return;
+  try{
+    const n=new Notification(title,{body,tag:'faisaa-budget',renotify:true,silent:false});
+    n.onclick=()=>{ try{ window.focus(); go('alerts'); n.close(); }catch(_){} };
+  }catch(_){}
+}
+
+/* Human copy for a budget event. */
+function budAlert(a){
+  const c=CUR[a.currency],cat_=cat(a.categoryId);
+  const name=cat_?cat_.name:'Category';
+  const icon=cat_?cat_.icon:'•';
+  const over=a.kind==='over';
+  const diff=Math.abs(a.spent-a.limit);
+  return {
+    icon,
+    title: over ? `${name} is over its limit` : `${name} is close to its limit`,
+    body: over
+      ? `Spent ${fmt(a.spent,a.currency)} of ${fmt(a.limit,a.currency)} — ${fmt(diff,a.currency)} over for ${monthName(a.month)}.`
+      : `Spent ${fmt(a.spent,a.currency)} of ${fmt(a.limit,a.currency)} — ${fmt(a.limit-a.spent,a.currency)} left for ${monthName(a.month)}.`,
+    short: over
+      ? `${name} over by ${fmt(diff,a.currency,{nosym:false})}`
+      : `${Math.round((a.spent/a.limit)*100)}% of ${name} limit`
+  };
+}
+function monthName(key){
+  if(!key) return 'this month';
+  const [y,m]=key.split('-').map(Number);
+  return new Date(y,m-1,1).toLocaleDateString('en',{month:'long',year:'numeric'});
+}
+
+/* Called after every mutation (and on boot) — the single place that decides
+   whether a limit was crossed. Idempotent: safe to call as often as we like. */
+function checkBudgets(){
+  const cfg=alertsCfg();
+  const now=new Date(), mk=monthKey(now);
+  let announced=false, levelMoved=false;
+
+  // A new month starts every limit fresh: reset the remembered level and the
+  // "already told you" markers, but keep the inbox history.
+  if(cfg.lastMonth!==mk){
+    cfg.lastMonth=mk; levelMoved=true;
+    (S.budgets||[]).forEach(b=>{ b.lastLevel='ok'; b.notifiedMonth=null; b.notifiedLevel=null; });
+  }
+  if(!cfg.budgets) return false;
+
+  budgetsFor().forEach(b=>{
+    if(!cat(b.categoryId)) return;
+    const spent=catSpent(b.categoryId,b.currency,now);
+    const level=budLevel(spent,b.limit);
+    const prev=b.lastLevel||'ok';
+    const why=budTransition(prev,level);
+
+    if(why==='over'||why==='near'){
+      // Only announce once per threshold per month, even across devices.
+      if(b.notifiedMonth!==mk||BUD_RANK[level]>BUD_RANK[b.notifiedLevel||'ok']){
+        const rec=addAlert({kind:level,categoryId:b.categoryId,currency:b.currency,
+          spent,limit:b.limit,month:mk,at:new Date().toISOString()});
+        const copy=budAlert(rec);
+        pushOS(copy.title,copy.body);
+        toast(level==='over'?'warn':'info',copy.short);
+        announced=true;
+        b.notifiedMonth=mk; b.notifiedLevel=level;
+      }
+    } else if(why==='back'){
+      // Spent came back under the limit (an edit or a delete) — silently reset.
+      if(b.notifiedMonth===mk) b.notifiedLevel='ok';
+    }
+    if(b.lastLevel!==level) levelMoved=true;
+    b.lastLevel=level;
+  });
+  // Persist whenever a level moved: `lastLevel` must survive a reload or the
+  // app would re-announce the same threshold on next open.
+  if(levelMoved) saveLocal();
+  return announced;
+}
+
+/* ============ RECURRING ENGINE ============ */
+/* A rule fires once per calendar month on `day`, clamped to the month's length
+   (day 31 → Feb 28/29). `lastRun` stores the YYYY-MM key of the last posting,
+   which makes catch-up idempotent: reopening the app twice never double-posts. */
+
+/* Function declarations (not const arrows) so seed() can call them at load time. */
+function monthKey(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); }
+function daysInMonth(y,m){ return new Date(y,m+1,0).getDate(); }
+function clampDay(y,m,day){ return Math.min(day, daysInMonth(y,m)); }
+
+/* Date this rule was/is due within the given month. */
+function dueDateIn(r,y,m){ return new Date(y,m,clampDay(y,m,r.day),9,0,0); }
+
+/* Month key of the most recent occurrence at or before today. */
+function lastDueKey(r){
+  const n=new Date();
+  const thisMonth=dueDateIn(r,n.getFullYear(),n.getMonth());
+  if(thisMonth<=n) return monthKey(n);
+  const prev=new Date(n.getFullYear(),n.getMonth()-1,1);
+  return monthKey(prev);
+}
+
+/* Next upcoming occurrence, as a Date. */
+function nextDue(r){
+  const n=new Date();
+  const thisMonth=dueDateIn(r,n.getFullYear(),n.getMonth());
+  if(thisMonth>n) return thisMonth;
+  const nx=new Date(n.getFullYear(),n.getMonth()+1,1);
+  return dueDateIn(r,nx.getFullYear(),nx.getMonth());
+}
+function daysUntil(d){
+  const a=new Date();a.setHours(0,0,0,0);
+  const b=new Date(d);b.setHours(0,0,0,0);
+  return Math.round((b-a)/86400000);
+}
+function dueLabel(r){
+  const n=daysUntil(nextDue(r));
+  if(n===0) return 'Today';
+  if(n===1) return 'Tomorrow';
+  if(n<=31) return 'in '+n+' days';
+  return nextDue(r).toLocaleDateString('en',{day:'numeric',month:'short'});
+}
+const ordinal = d => d+(['th','st','nd','rd'][(d%100-20)%10]||['th','st','nd','rd'][d%100]||'th');
+
+/* Every month key strictly after `lastRun`, up to and including any due month. */
+function pendingMonths(r){
+  if(!r.active) return [];
+  const out=[],n=new Date();
+  let y,m;
+  if(r.lastRun){
+    const [ly,lm]=r.lastRun.split('-').map(Number);
+    y=ly; m=lm-1;
+    const c=new Date(y,m+1,1); y=c.getFullYear(); m=c.getMonth();
+  } else {
+    const c=new Date(r.created); y=c.getFullYear(); m=c.getMonth();
+  }
+  // Walk forward, capped at 24 months so a long-dormant rule can't flood the ledger.
+  let guard=0;
+  while(guard++<24){
+    const due=dueDateIn(r,y,m);
+    if(due>n) break;
+    out.push({key:monthKey(new Date(y,m,1)),date:due});
+    const c=new Date(y,m+1,1); y=c.getFullYear(); m=c.getMonth();
+  }
+  return out;
+}
+
+/* Post every rule that has come due. Returns the number of transactions created. */
+function runRecurring(){
+  let posted=0, names=[];
+  (S.recurring||[]).forEach(r=>{
+    if(!r.active) return;
+    if(!acct(r.accountId)) return;              // account deleted → rule goes dormant
+    pendingMonths(r).forEach(occ=>{
+      S.txns.unshift({
+        id:uid(), accountId:r.accountId, currency:r.currency, amount:r.amount,
+        dir:r.dir, categoryId:r.categoryId, merchant:r.name,
+        at:occ.date.toISOString(), sync:S.offline?'pendingCreate':'synced',
+        fx:null, recurringId:r.id
+      });
+      enqueue('transaction','create');
+      r.lastRun=occ.key; posted++;
+      if(names.indexOf(r.name)<0) names.push(r.name);
+    });
+  });
+  if(posted){
+    S.txns.sort((x,y)=>new Date(y.at)-new Date(x.at));
+    S.ui.autoPosted={count:posted,names};
+  }
+  return posted;
+}
+
+/* ============ VALIDATION ============ */
+function parseAmount(raw,cur){
+  const t=(raw||'').trim(); if(!t) return {err:'Enter an amount'};
+  let c=t.replace(/[₹\s]|Rf/g,'');
+  if(c.includes(',')&&c.includes('.')) c=c.replace(/,/g,'');
+  else if((c.match(/,/g)||[]).length===1&&c.length-c.indexOf(',')<=3) c=c.replace(',','.');
+  else c=c.replace(/,/g,'');
+  if(!/^-?\d*\.?\d*$/.test(c)||c===''||c==='.') return {err:`"${t}" isn't a valid amount`};
+  const n=parseFloat(c);
+  if(isNaN(n)) return {err:`"${t}" isn't a valid amount`};
+  if(n<=0) return {err:'Amount must be greater than zero'};
+  if(n>9999999999) return {err:'That amount is too large'};
+  return {minor:Math.round(n*100)};
+}
+function parseRate(raw){
+  const t=(raw||'').trim(); if(!t) return {rate:null};
+  const c=t.replace(',','.');
+  if(!/^\d*\.?\d*$/.test(c)||c===''||c==='.') return {err:`"${t}" isn't a valid rate`};
+  const n=parseFloat(c);
+  if(isNaN(n)||!isFinite(n)) return {err:`"${t}" isn't a valid rate`};
+  if(n<=0) return {err:'Exchange rate must be greater than zero'};
+  if(n>100000) return {err:`A rate of ${n} looks wrong`};
+  return {rate:n};
+}
+
+/* ============ TRANSFERS ============ */
+/* A transfer is TWO independent transactions sharing a groupId — never one
+   record spanning currencies. The out-leg is booked in the source currency,
+   the in-leg in the destination currency. Each folds only into its own total,
+   so INR and MVR stay completely separate even for a cross-currency move.
+   The rate converts the AMOUNT ENTERED; it never converts a balance. */
+
+const TRANSFER_CAT='c11';
+
+function transferPreview(fromId,toId,rawAmount,rawRate){
+  const from=acct(fromId), to=acct(toId);
+  const res={errs:{},from,to,cross:false,out:null,inn:null,rate:null,remaining:null};
+  if(!from||!to){ res.errs.acct='Pick both accounts'; return res; }
+  if(from.id===to.id){ res.errs.acct='Choose two different accounts'; return res; }
+  res.cross = from.currency!==to.currency;
+
+  const p=parseAmount(rawAmount,from.currency);
+  if(p.err){ res.errs.amount=p.err; return res; }
+  res.out={minor:p.minor,cur:from.currency};
+
+  if(res.cross){
+    const rr=parseRate(rawRate);
+    if(rr.err){ res.errs.rate=rr.err; return res; }
+    if(rr.rate===null){ res.errs.rate='Enter an exchange rate for this transfer'; return res; }
+    res.rate=rr.rate;
+    res.inn={minor:Math.round(p.minor*rr.rate),cur:to.currency};
+    if(res.inn.minor<1){ res.errs.rate='That rate converts to less than the smallest unit'; return res; }
+  } else {
+    res.inn={minor:p.minor,cur:to.currency};
+  }
+
+  const bal=balance(from.id);
+  res.remaining=bal-p.minor;
+  res.over = res.remaining<0 && bal>=0;
+  return res;
+}
+
+function commitTransfer(fromId,toId,rawAmount,rawRate,note){
+  const r=transferPreview(fromId,toId,rawAmount,rawRate);
+  if(Object.keys(r.errs).length) return {errs:r.errs};
+
+  const gid=uid(), when=new Date().toISOString();
+  const fxOut = r.cross?{base:r.from.currency,quote:r.to.currency,rate:r.rate,converted:r.inn.minor}:null;
+  const fxIn  = r.cross?{base:r.to.currency,quote:r.from.currency,rate:+(1/r.rate).toFixed(6),converted:r.out.minor}:null;
+
+  // Leg 1 — debit source, in SOURCE currency only.
+  S.txns.unshift({id:uid(),accountId:r.from.id,currency:r.from.currency,amount:r.out.minor,
+    dir:'debit',categoryId:TRANSFER_CAT,merchant:'To '+r.to.name,note:note||null,
+    at:when,sync:S.offline?'pendingCreate':'synced',fx:fxOut,transferId:gid,transferLeg:'out'});
+  // Leg 2 — credit destination, in DESTINATION currency only.
+  S.txns.unshift({id:uid(),accountId:r.to.id,currency:r.to.currency,amount:r.inn.minor,
+    dir:'credit',categoryId:TRANSFER_CAT,merchant:'From '+r.from.name,note:note||null,
+    at:when,sync:S.offline?'pendingCreate':'synced',fx:fxIn,transferId:gid,transferLeg:'in'});
+
+  enqueue('transaction','create'); enqueue('transaction','create');
+  S.txns.sort((x,y)=>new Date(y.at)-new Date(x.at));
+  return {ok:true,groupId:gid,out:r.out,inn:r.inn,cross:r.cross};
+}
+
+/* Deleting either leg removes both — a half transfer would corrupt one ledger. */
+function deleteTransfer(groupId){
+  const legs=S.txns.filter(t=>t.transferId===groupId);
+  S.txns=S.txns.filter(t=>t.transferId!==groupId);
+  enqueue('transaction','delete');
+  return legs;
+}
+
+/* ============ SYNC ============ */
+let drainTimer=null;
+function enqueue(entity,op){ if(S.offline){S.queue.push({entity,op,attempts:0});paintQueue();} }
+function paintQueue(){ document.getElementById('queueCount').textContent=S.queue.length+' queued'; }
+function toggleOffline(){
+  S.offline=!S.offline;
+  document.getElementById('offlineBanner').classList.toggle('on',S.offline);
+  if(!S.offline&&S.queue.length){
+    toast('info','Syncing '+S.queue.length+' change'+(S.queue.length>1?'s':'')+'…');
+    const step=()=>{
+      if(!S.queue.length||S.offline)return;
+      S.queue.shift();paintQueue();
+      const p=S.txns.find(t=>t.sync!=='synced');if(p)p.sync='synced';
+      render();
+      if(S.queue.length) drainTimer=setTimeout(step,350);
+      else toast('ok','All changes synced');
+    };
+    drainTimer=setTimeout(step,500);
+  }
+  render();
+}
+
+/* ============ TOAST ============ */
+let toastTimer=null;
+function toast(kind,msg,undo){
+  const el=document.getElementById('toast');
+  el.className='toast on '+kind;
+  document.getElementById('toastIcon').textContent={ok:'✓',warn:'⚠',err:'✕',info:'ⓘ'}[kind];
+  document.getElementById('toastMsg').textContent=msg;
+  const act=document.getElementById('toastAction');
+  act.innerHTML = undo?'<button>Undo</button>':'';
+  if(undo) act.querySelector('button').onclick=()=>{undo();el.classList.remove('on')};
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>el.classList.remove('on'),undo?4500:2600);
+}
+
+/* ============ NAV ============ */
+function go(tab){S.ui.tab=tab;S.ui.stack=[];render();document.getElementById('screen').scrollTop=0}
+function push(route,data){S.ui.stack.push({route,data});render();document.getElementById('screen').scrollTop=0}
+function pop(){S.ui.stack.pop();render()}
+
+let sheetState={};
+function openSheet(kind,data){
+  sheetState={kind,data:data||{},form:{}};
+  if(kind==='newTxn'){
+    const dir=(data&&data.dir)||'debit';
+    sheetState.form={dir,amount:'',acct:(data&&data.acct)||(active()[0]&&active()[0].id),
+                     cat:(data&&data.cat)||(dir==='credit'?'c9':'c1'),merchant:'',
+                     note:(data&&data.note)||'',fx:false,rate:'',errs:{}};
+  } else if(kind==='transfer'){
+    const list=active();
+    const from=(data&&data.from)||(list[0]&&list[0].id);
+    const to=(list.find(x=>x.id!==from)||{}).id;
+    const f=acct(from),t=acct(to);
+    let rate='';
+    if(f&&t&&f.currency!==t.currency){
+      const p=S.rates.find(r=>r.base===f.currency&&r.quote===t.currency);
+      const inv=S.rates.find(r=>r.base===t.currency&&r.quote===f.currency);
+      rate=p?String(p.rate):(inv?String(+(1/inv.rate).toFixed(6)):'');
+    }
+    sheetState.form={from,to,amount:'',rate,note:'',errs:{}};
+  } else if(kind==='newRec'||kind==='editRec'){
+    const r=(kind==='editRec')?S.recurring.find(x=>x.id===data.id):null;
+    sheetState.form=r
+      ? {id:r.id,name:r.name,acct:r.accountId,dir:r.dir,amount:String(r.amount/100),
+         cat:r.categoryId,day:r.day,active:r.active,errs:{}}
+      : {name:'',acct:active()[0]&&active()[0].id,dir:'debit',amount:'',cat:'c4',
+         day:new Date().getDate(),active:true,errs:{}};
+  } else if(kind==='editTxn'){
+    const t=S.txns.find(x=>x.id===data.id);
+    sheetState.form={dir:t.dir,amount:(t.amount/100).toString(),acct:t.accountId,cat:t.categoryId,merchant:t.merchant||'',
+                     note:t.note||'',fx:!!t.fx,rate:t.fx?t.fx.rate.toString():'',errs:{},id:t.id};
+  } else if(kind==='newAcct'){
+    sheetState.form={name:'',inst:'',kind:'bank',currency:'MVR',opening:'',mask:'',color:'#2E5BFF',include:true,errs:{}};
+  } else if(kind==='editAcct'){
+    const a=acct(data.id);
+    sheetState.form={...a,opening:(a.opening/100).toString(),inst:a.inst||'',mask:a.mask||'',errs:{},id:a.id,
+                     locked:S.txns.some(t=>t.accountId===a.id)};
+  } else if(kind==='rate'){
+    const p=S.rates.find(r=>r.base==='INR'&&r.quote==='MVR');
+    sheetState.form={base:'INR',quote:'MVR',raw:p?p.rate.toString():'',errs:{}};
+  } else if(kind==='newBudget'||kind==='editBudget'){
+    const b=kind==='editBudget'?(S.budgets||[]).find(x=>x.id===data.id):null;
+    const cur=(b&&b.currency)||(data&&data.cur)||S.settings.primary||'MVR';
+    sheetState.form=b
+      ? {id:b.id,cat:b.categoryId,cur:b.currency,raw:String(b.limit/100),errs:{}}
+      : {cat:(data&&data.cat)||'c1',cur,raw:'',errs:{}};
+  } else if(kind==='delAcct'){
+    sheetState.form={choice:0,target:null,errs:{}};
+  }
+  renderSheet();
+  document.getElementById('backdrop').classList.add('on');
+  document.getElementById('sheet').classList.add('on');
+}
+function closeSheet(){
+  document.getElementById('backdrop').classList.remove('on');
+  document.getElementById('sheet').classList.remove('on');
+  setTimeout(()=>{sheetState={};},420);
+}
+
+/* ============ SVG ============ */
+function sparkline(vals,color){
+  if(!vals.length) return '';
+  const w=140,h=44,max=Math.max(...vals,1);
+  const pts=vals.map((v,i)=>[i/(vals.length-1)*w,h-(v/max)*(h-6)-3]);
+  const d=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
+  const area=d+` L${w} ${h} L0 ${h} Z`;
+  const gid='g'+Math.random().toString(36).slice(2,7);
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%">
+    <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="${color}" stop-opacity=".45"/><stop offset="1" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient></defs>
+    <path d="${area}" fill="url(#${gid})"/>
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+function donut(slices,sel){
+  const size=216,r=90,ir=57,cx=size/2,cy=size/2;
+  if(!slices.length) return '';
+  let ang=-Math.PI/2,out='';
+  slices.forEach((s,i)=>{
+    const sweep=s.share*Math.PI*2, end=ang+sweep-0.03;
+    const on=sel===i, R=on?r+7:r;
+    const p=(a,rad)=>[cx+Math.cos(a)*rad,cy+Math.sin(a)*rad];
+    const [x1,y1]=p(ang,R),[x2,y2]=p(end,R),[x3,y3]=p(end,ir),[x4,y4]=p(ang,ir);
+    const large=sweep>Math.PI?1:0;
+    const d=`M${x1} ${y1} A${R} ${R} 0 ${large} 1 ${x2} ${y2} L${x3} ${y3} A${ir} ${ir} 0 ${large} 0 ${x4} ${y4} Z`;
+    out+=`<path class="slice" d="${d}" fill="${s.cat.color}" opacity="${sel===null||on?1:.3}" onclick="pickSlice(${i})"/>`;
+    ang+=sweep;
+  });
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${out}</svg>`;
+}
+function gaugeSVG(pct,color){
+  const r=86,c=2*Math.PI*r;
+  return `<svg width="200" height="200" viewBox="0 0 200 200">
+    <circle cx="100" cy="100" r="${r}" fill="none" stroke="rgba(120,120,128,.16)" stroke-width="15"/>
+    <circle cx="100" cy="100" r="${r}" fill="none" stroke="${color}" stroke-width="15" stroke-linecap="round"
+      stroke-dasharray="${c}" stroke-dashoffset="${c*(1-pct)}"
+      style="transition:stroke-dashoffset .6s cubic-bezier(.2,.9,.3,1),stroke .3s"/>
+  </svg>`;
+}
+
+/* ============ ICONS ============ */
+const ICO={
+  home:'<svg viewBox="0 0 28 28" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="2.6"/><rect x="15" y="3" width="10" height="10" rx="2.6"/><rect x="3" y="15" width="10" height="10" rx="2.6"/><rect x="15" y="15" width="10" height="10" rx="2.6"/></svg>',
+  card:'<svg viewBox="0 0 28 28" fill="currentColor"><rect x="2" y="6" width="24" height="17" rx="3.6"/><rect x="2" y="10.5" width="24" height="3" fill="var(--barbg)" opacity=".9"/></svg>',
+  chart:'<svg viewBox="0 0 28 28" fill="currentColor"><path d="M14 3.5A10.5 10.5 0 1024.5 14H14V3.5z"/><path d="M15.8 2.2A10.5 10.5 0 0125.8 12.2H15.8V2.2z" opacity=".5"/></svg>',
+  gear:'<svg viewBox="0 0 28 28" fill="currentColor"><path d="M14 9.6a4.4 4.4 0 100 8.8 4.4 4.4 0 000-8.8zm10.6 4.4c0 .5 0 .9-.1 1.4l2.3 1.8-2.3 4-2.8-1.2c-.7.6-1.5 1-2.3 1.4l-.4 3h-4.6l-.4-3c-.8-.3-1.6-.8-2.3-1.4l-2.8 1.2-2.3-4 2.3-1.8a11 11 0 010-2.8L4.6 10.4l2.3-4 2.8 1.2c.7-.6 1.5-1 2.3-1.4l.4-3h4.6l.4 3c.8.3 1.6.8 2.3 1.4l2.8-1.2 2.3 4-2.3 1.8c.1.5.1.9.1 1.4z"/></svg>'
+};
+
+/* ============ RENDER ============ */
+function render(){
+  try{ paintQueue(); }catch(_){}
+  const top=S.ui.stack[S.ui.stack.length-1];
+  const nav=document.getElementById('navrow'),scr=document.getElementById('screenwrap');
+
+  if(top){
+    nav.innerHTML=`<button class="backbtn" onclick="pop()"><i>‹</i> Back</button>
+      <span class="inline">${routeTitle(top)}</span>
+      <span style="min-width:60px;text-align:right">${routeAction(top)}</span>`;
+    scr.innerHTML=routeBody(top);
+  } else {
+    const t=S.ui.tab;
+    const titles={dashboard:'Home',accounts:'Accounts',reports:'Reports',settings:'Settings'};
+    const actions={
+      dashboard:`<button class="navbtn" onclick="openSheet('newTxn')" ${active().length?'':'disabled'}>+</button>`,
+      accounts:`<button class="navbtn" onclick="openSheet('newAcct')">+</button>`,
+      reports:'',settings:''};
+    const un=unreadAlerts();
+    const bell=`<button class="navbtn qab" style="font-size:19px" onclick="push('alerts',{})" aria-label="Alerts">🔔${
+      un?`<i class="dotb">${un>9?'9+':un}</i>`:''}</button>`;
+    nav.innerHTML=`<h1>${titles[t]}</h1>
+      <span style="display:flex;align-items:center;gap:4px">
+        <span class="syncpill" id="syncPill"><i class="dot"></i>…</span>${bell}${actions[t]||''}</span>`;
+    scr.innerHTML={dashboard:vDashboard,accounts:vAccounts,reports:vReports,settings:vSettings}[t]();
+  }
+  renderTabs();
+  if(typeof paintSyncPill==='function') paintSyncPill();
+  requestAnimationFrame(()=>{
+    document.querySelectorAll('.track i[data-w]').forEach(el=>el.style.width=el.dataset.w+'%');
+    document.querySelectorAll('.bar[data-h]').forEach(el=>el.style.height=el.dataset.h+'px');
+  });
+}
+
+function renderTabs(){
+  const left=[['dashboard','Home',ICO.home],['accounts','Accounts',ICO.card]];
+  const right=[['reports','Reports',ICO.chart],['settings','Settings',ICO.gear]];
+  const acc=CUR[S.settings.primary].color;
+  const btn=([k,l,ic])=>`<button class="tabbtn ${S.ui.tab===k?'on':''}" style="${S.ui.tab===k?'color:'+acc:''}"
+    onclick="go('${k}')">${ic}<span>${l}</span></button>`;
+  const tint=S.settings.primary==='INR'?'inrTint':'';
+  document.getElementById('tabwrap').innerHTML =
+    left.map(btn).join('') +
+    `<div class="fabslot"><button class="fab ${tint} ${fabOpen?'open':''}" id="fabBtn"
+       aria-label="Add" onclick="toggleFab()"><span>+</span></button></div>` +
+    right.map(btn).join('');
+}
+
+/* ===== Quick-add FAB ===== */
+let fabOpen=false;
+function toggleFab(){ fabOpen?closeFab():openFab(); }
+function openFab(){
+  if(!active().length){
+    toast('info','Add an account first');
+    openSheet('newAcct');
+    return;
+  }
+  fabOpen=true;
+  const items=[
+    ['Expense','Record money going out','#FF3B30','−',"openSheet('newTxn',{dir:'debit'})"],
+    ['Income','Record money coming in','#34C759','+',"openSheet('newTxn',{dir:'credit'})"],
+    ['Transfer','Move between accounts','#5856D6','⇄',"openSheet('transfer')"],
+    ['Recurring','Schedule a monthly item','#FF9500','↻',"openSheet('newRec')"]
+  ];
+  document.getElementById('fabmenu').innerHTML=items.map(([t,s,c,g,fn],i)=>
+    `<button class="fabitem" style="transition-delay:${i*38}ms" onclick="closeFab();setTimeout(()=>{${fn}},170)">
+       <span class="ic" style="background:linear-gradient(140deg,${c},${c}bb)">${g}</span>
+       <span class="tx"><b>${t}</b><span>${s}</span></span></button>`).join('');
+  document.getElementById('fabmask').classList.add('on');
+  requestAnimationFrame(()=>document.getElementById('fabmenu').classList.add('on'));
+  renderTabs();
+}
+function closeFab(){
+  if(!fabOpen) return;
+  fabOpen=false;
+  const menu=document.getElementById('fabmenu');
+  menu.classList.remove('on');
+  document.getElementById('fabmask').classList.remove('on');
+  setTimeout(()=>{ if(!fabOpen) menu.innerHTML=''; },320);
+  renderTabs();
+}
+
+/* ---- DASHBOARD ---- */
+function vDashboard(){
+  if(!active().length) return `<div class="empty"><div class="g">🗂</div><h3>No accounts yet</h3>
+    <p>Add an INR or MVR account and your totals appear here — tracked separately, never mixed.</p>
+    <button class="btn" onclick="openSheet('newAcct')">Add your first account</button></div>`;
+
+  const ts=orderedTotals();
+  const cards=ts.map((t,i)=>{
+    const c=CUR[t.currency];
+    return `<div class="total ${c.cls}" style="animation-delay:${i*.08}s;margin-bottom:12px" onclick="push('list',{cur:'${t.currency}'})">
+      <div class="top">
+        <div class="who"><span class="flag">${c.flag}</span><div><b>${t.currency} Total</b><span>${c.name}</span></div></div>
+        ${t.pending?`<span class="pill">↻ ${t.pending}</span>`:''}
+      </div>
+      ${t.count===0
+        ? `<div style="font-size:20px;font-weight:600;letter-spacing:-.4px">No ${t.currency} accounts</div>
+           <div style="font-size:13px;opacity:.78;margin-top:5px">Add one to start tracking</div>`
+        : `<div class="amt">${fmt(t.balance,t.currency)}</div>
+           <div class="stats">
+             <div class="s"><span>↙</span><div><i>In</i><b>${compact(t.earned,t.currency)}</b></div></div>
+             <div class="s"><span>↗</span><div><i>Out</i><b>${compact(t.spent,t.currency)}</b></div></div>
+             <div style="margin-left:auto;font-size:11.5px;opacity:.78">${t.count} account${t.count===1?'':'s'}</div>
+           </div>`}
+    </div>`;
+  }).join('');
+
+  const qa=[['⇄','Transfer','#5856D6',"openSheet('transfer')"],['↻','Recurring','#FF9500',"push('recurring',{})"],
+            ['🎯','Budgets','#FF2D55',"push('budgets',{})"],['💱','Rate','#0B7285',"openSheet('rate')"]]
+    .map(([i,l,c,f])=>`<button class="qa" onclick="${f}"><span class="ic" style="background:${c}22;color:${c}">${i}</span>${l}</button>`).join('');
+
+  // Upcoming recurring — next 3 due within 10 days.
+  const up=(S.recurring||[]).filter(r=>r.active&&acct(r.accountId)&&daysUntil(nextDue(r))<=14)
+    .sort((a,b)=>nextDue(a)-nextDue(b)).slice(0,3);
+  const upSec=up.length?`<div class="sec">
+    <div class="sechead"><h2>Upcoming</h2><button onclick="push('recurring',{})">Manage</button></div>
+    <div class="card">${up.map(r=>{
+      const c=cat(r.categoryId),a=acct(r.accountId),d=daysUntil(nextDue(r));
+      return `<div class="row" onclick="push('recurring',{})">
+        <span class="ic" style="background:${c.color}26;color:${c.color}">${c.icon}</span>
+        <div class="mid"><b>${r.name}</b><span>${a.name} · ${ordinal(r.day)} monthly</span></div>
+        <div class="rt"><b class="${r.dir==='credit'?'cr':''}">${r.dir==='debit'?'−':'+'}${fmt(r.amount,r.currency)}</b>
+          <span class="duepill ${d<=3?'soon':''}">${dueLabel(r)}</span></div>
+      </div>`}).join('')}</div></div>`:'';
+
+  const minis=ts.map(t=>{
+    const c=CUR[t.currency];
+    return `<div class="card mini" onclick="push('month',{cur:'${t.currency}'})">
+      <span class="badge ${c.cls}">${c.flag} ${t.currency}</span>
+      <div class="v">${fmt(t.spent,t.currency)}</div>
+      <div class="l">spent this month</div>
+      ${sparkline(dailySpend(t.currency,new Date()),c.color)}
+    </div>`;
+  }).join('');
+
+  const recent=S.txns.slice(0,6);
+
+  // Budgets worth surfacing: the tightest three in the primary currency, plus
+  // anything already over — this is where a limit earns its keep at a glance.
+  const bcur=S.settings.primary||'MVR';
+  const bset=budgetRows(bcur,new Date());
+  const bshow=bset.rows.slice(0,3);
+  const budSec=bshow.length?`<div class="sec">
+    <div class="sechead"><h2>Budgets</h2><button onclick="push('budgets',{cur:'${bcur}'})">Manage</button></div>
+    <div class="card">${bshow.map(r=>`
+      <div class="bud ${r.level==='over'?'over':''}" onclick="openSheet('editBudget',{id:'${r.b.id}'})">
+        <div class="top">
+          <span class="ic" style="background:${r.category.color}26;color:${r.category.color}">${r.category.icon}</span>
+          <div class="nm"><b>${r.category.name}</b><span>${fmt(r.spent,bcur)} of ${fmt(r.b.limit,bcur)}</span></div>
+          <div class="amt"><b class="${r.level==='over'?'over':(r.level==='near'?'near':'')}">${Math.round(r.pct*100)}%</b></div>
+        </div>
+        <div class="track"><i style="width:${Math.min(r.pct,1)*100}%;background:${r.level==='over'?'var(--red)':r.level==='near'?'var(--orange)':r.category.color}"></i></div>
+      </div>`).join('')}</div>
+    ${bset.rows.some(r=>r.level!=='ok')?`<div style="display:flex;gap:6px;align-items:center;justify-content:center;font-size:12px;color:var(--txt3);margin-top:12px">
+      <span>🔔</span><span>${bset.rows.filter(r=>r.level==='over').length
+        ?`${bset.rows.filter(r=>r.level==='over').length} categor${bset.rows.filter(r=>r.level==='over').length===1?'y is':'ies are'} over budget`
+        :'Some categories are close to their limit'}</span></div>`:''}
+  </div>`:'';
+
+  return `<div class="sec">${cards}
+    <div class="segnote"><span>🔒</span><span>INR and MVR balances are tracked separately and never combined.</span></div></div>
+    <div class="quick">${qa}</div>
+    ${budSec}
+    ${upSec}
+    <div class="sec"><div class="sechead"><h2>This month</h2><button onclick="go('reports')">Reports</button></div>
+      <div class="minis">${minis}</div></div>
+    <div class="sec"><div class="sechead"><h2>Recent</h2><button onclick="push('list',{cur:null})">See all</button></div>
+      ${recent.length?`<div class="card">${recent.map(t=>txnRow(t)).join('')}</div>`
+            :`<div class="card"><div class="empty" style="padding:36px 16px"><div class="g">📄</div><h3>No transactions</h3>
+              <p>Record your first expense to see it here.</p>
+              <button class="btn" onclick="openSheet('newTxn')">Add transaction</button></div></div>`}
+    </div>`;
+}
+
+function txnRow(t,hideAcct){
+  const c=cat(t.categoryId),a=acct(t.accountId),cu=CUR[t.currency];
+  const hint = S.settings.hints&&t.fx
+    ? `<span style="font-size:11px;color:var(--txt4)">≈ ${fmt(t.fx.converted,t.fx.quote)}</span>`
+    : `<span class="badge ${cu.cls}">${t.currency}</span>`;
+  return `<div class="row" onclick="push('txn',{id:'${t.id}'})">
+    <span class="ic" style="background:${c.color}26;color:${c.color}">${c.icon}</span>
+    <div class="mid"><b>${esc(t.merchant)||c.name}</b>
+      <span>${t.note?'📝 '+esc(t.note)+' · ':''}${hideAcct?'':(a?a.name+' · ':'')}${new Date(t.at).toLocaleDateString('en',{day:'numeric',month:'short'})}${t.sync!=='synced'?' · ↻':''}</span></div>
+    <div class="rt"><b class="${t.dir==='credit'?'cr':''}">${t.dir==='debit'?'−':'+'}${fmt(t.amount,t.currency)}</b>${hint}</div>
+  </div>`;
+}
+
+/* ---- ACCOUNTS ---- */
+function vAccounts(){
+  if(!S.accounts.length) return `<div class="empty"><div class="g">💳</div><h3>No accounts yet</h3>
+    <p>Create separate accounts for your INR and MVR money. Each keeps its own balance.</p>
+    <button class="btn" onclick="openSheet('newAcct')">Add account</button></div>`;
+
+  const section=cur=>{
+    const bs=banksIn(cur),t=totals(cur),c=CUR[cur];
+    return `<div class="sec">
+      <div class="sechead"><h2>${c.flag} ${cur} Banks</h2>
+        ${bs.length?`<span style="font-size:16px;font-weight:600;color:${c.color};font-variant-numeric:tabular-nums;letter-spacing:-.3px">${fmt(t.balance,cur)}</span>`:''}</div>
+      ${bs.length?bs.map(a=>acctCard(a)).join('')
+        :`<div class="addcard" onclick="openSheet('newAcct')"><span class="plus">+</span><div>
+            <div class="t">No ${cur} bank accounts</div><div class="s">Add ${cur} account</div></div></div>`}
+    </div>`;
+  };
+  const ws=wallets();
+  const walletSec=ws.length?`<div class="sec">
+    <div class="sechead"><h2>Wallets & Cash</h2><span style="font-size:12px;color:var(--txt4)">per-currency</span></div>
+    ${ws.map(a=>acctCard(a)).join('')}</div>`:'';
+  const arch=S.accounts.filter(a=>a.archived);
+  const archSec=arch.length?`<div class="sec">
+    <div class="sechead"><h2 style="font-size:16px;color:var(--txt3);font-weight:600">Archived (${arch.length})</h2></div>
+    ${arch.map(a=>acctCard(a,true)).join('')}</div>`:'';
+
+  return section('INR')+section('MVR')+walletSec+archSec;
+}
+function acctCard(a,dim){
+  const b=balance(a.id),cu=CUR[a.currency];
+  const sub=[a.inst,KINDS[a.kind].l,a.mask?'•••• '+a.mask:''].filter(Boolean).join(' · ');
+  return `<div class="card acct" style="${dim?'opacity:.5':''}" onclick="push('acct',{id:'${a.id}'})">
+    <span class="ic" style="background:linear-gradient(135deg,${a.color},${a.color}c0)">${KINDS[a.kind].i}</span>
+    <div class="mid"><div class="nm"><b>${a.name}</b><span class="badge ${cu.cls}">${cu.flag} ${a.currency}</span></div><span>${sub}</span></div>
+    <div><div class="bal ${b<0?'neg':''}">${fmt(b,a.currency)}</div>
+      ${!a.include?'<div style="font-size:10px;color:var(--txt4);text-align:right;margin-top:1px">excluded</div>':''}</div>
+    <span class="chev">›</span></div>`;
+}
+
+/* ---- REPORTS ---- */
+function vReports(){
+  const cur=S.ui.reportCur,month=S.ui.reportMonth,c=CUR[cur];
+  const seg=`<div class="seg">${['INR','MVR'].map(x=>
+    `<button class="${cur===x?'on':''}" onclick="setReportCur('${x}')">${CUR[x].flag} ${x}</button>`).join('')}</div>
+    <div style="font-size:12px;color:var(--txt4);text-align:center;margin:9px 0 20px;letter-spacing:-.1px">Reports cover one currency at a time. Figures are never combined.</div>`;
+
+  if(!acctsIn(cur).length) return seg+`<div class="empty"><div class="g">📊</div><h3>No ${cur} accounts</h3>
+    <p>Add a ${c.name} account to see its reports.</p>
+    <button class="btn" onclick="openSheet('newAcct')">Add account</button></div>`;
+
+  const isNow=month.getMonth()===new Date().getMonth()&&month.getFullYear()===new Date().getFullYear();
+  const nav=`<div class="card monthbar">
+    <button onclick="shiftMonth(-1)">‹</button>
+    <span class="m">${month.toLocaleDateString('en',{month:'long',year:'numeric'})}</span>
+    <button onclick="shiftMonth(1)" ${isNow?'disabled':''}>›</button></div>`;
+
+  const t=totals(cur,month);
+  const sums=`<div class="summaries">
+    ${[['↗','Spent',t.spent,'#FF3B30'],['↙','Earned',t.earned,'#34C759'],['=','Net',t.earned-t.spent,c.color]]
+      .map(([i,l,v,col])=>`<div class="card sm"><div class="h" style="color:${col}">${i} ${l}</div>
+        <div class="v">${compact(v,cur)}</div></div>`).join('')}</div>`;
+
+  const tr=trend(cur,6),max=Math.max(...tr.map(x=>x.spent),1);
+  const bars=`<div class="card pad" style="margin-bottom:18px"><h2 style="margin:0;font-size:18px;letter-spacing:-.4px">Last 6 months</h2>
+    <div class="barchart">${tr.map(p=>{
+      const on=p.month.getMonth()===month.getMonth()&&p.month.getFullYear()===month.getFullYear();
+      const h=Math.max(4,(p.spent/max)*122);
+      return `<div class="barcol ${on?'on':''}" onclick="setMonth(${p.month.getFullYear()},${p.month.getMonth()})">
+        <div class="bar" data-h="${h}" style="height:4px;background:linear-gradient(180deg,${c.color},${c.color}aa);opacity:${on?1:.4}"></div>
+        <span class="lb">${p.month.toLocaleDateString('en',{month:'narrow'})}</span></div>`}).join('')}</div>
+    <div style="font-size:11.5px;color:var(--txt4);text-align:center;margin-top:8px">tap a bar to jump to that month</div></div>`;
+
+  const sl=breakdown(cur,month),sel=S.ui.slice;
+  const center=sel!==null&&sl[sel]
+    ? `<div class="l">${sl[sel].cat.name}</div><div class="v">${fmt(sl[sel].total,cur)}</div><div class="p">${Math.round(sl[sel].share*100)}%</div>`
+    : `<div class="l">Total spent</div><div class="v">${fmt(t.spent,cur)}</div><span class="badge ${c.cls}">${cur}</span>`;
+  const pie=sl.length?`<div class="card pad" style="margin-bottom:18px">
+      <h2 style="margin:0;font-size:18px;letter-spacing:-.4px">Category breakdown</h2>
+      <div class="donutwrap">${donut(sl,sel)}<div class="donutcenter">${center}</div></div></div>`
+    :`<div class="card"><div class="empty" style="padding:38px 16px"><div class="g">🥧</div><h3>Nothing spent</h3>
+      <p>No ${cur} spending recorded for this month.</p></div></div>`;
+
+  const list=sl.length?`<div class="card">${sl.map((s,i)=>`
+    <div class="catbar" style="${sel===i?'background:'+s.cat.color+'14':''}" onclick="pickSlice(${i})">
+      <div class="t"><span class="ic" style="background:${s.cat.color}26;color:${s.cat.color}">${s.cat.icon}</span>
+        <div class="info">
+          <div class="l1"><span>${s.cat.name}</span><b>${fmt(s.total,cur)}</b></div>
+          <div class="track"><i data-w="${(s.share*100).toFixed(1)}" style="width:0;background:${s.cat.color}"></i></div>
+          <div class="l2"><span>${s.count} transaction${s.count===1?'':'s'}</span><span>${Math.round(s.share*100)}%</span></div>
+        </div></div></div>`).join('')}</div>`:'';
+
+  return seg+nav+sums+bars+pie+list;
+}
+function setReportCur(c){S.ui.reportCur=c;S.ui.slice=null;render()}
+function shiftMonth(d){const m=S.ui.reportMonth;S.ui.reportMonth=new Date(m.getFullYear(),m.getMonth()+d,1);S.ui.slice=null;render()}
+function setMonth(y,m){S.ui.reportMonth=new Date(y,m,1);S.ui.slice=null;render()}
+function pickSlice(i){S.ui.slice=S.ui.slice===i?null:i;render()}
+
+/* ---- SETTINGS ---- */
+function vSettings(){
+  const p=S.rates.find(r=>r.base==='INR'&&r.quote==='MVR');
+  const ap=window.__theme.pref;
+  const opts=[['system','Automatic','⚙'],['light','Light','☀︎'],['dark','Dark','☾']];
+  return `<div class="grouphead">Appearance</div>
+    <div class="seg">${opts.map(([k,l])=>
+      `<button class="${ap===k?'on':''}" onclick="setAppearance('${k}')">${l}</button>`).join('')}</div>
+    <div class="themepreview">
+      ${['light','dark'].map(m=>{
+        const on=window.__theme.resolve(ap)===m;
+        return `<div class="tp ${m} ${on?'on':''}" onclick="setAppearance('${m}')">
+          <div class="tpchrome"><span class="tpdot"></span><span class="tpbar"></span></div>
+          <div class="tpcard"><span class="tpline w60"></span><span class="tpline w40"></span></div>
+          <div class="tpcard"><span class="tpline w45"></span><span class="tpline w70"></span></div>
+          <div class="tplabel">${m==='light'?'Light':'Dark'}${on?' ✓':''}</div></div>`}).join('')}
+    </div>
+    <div class="groupfoot">${ap==='system'
+      ? 'Automatic follows your device setting — currently '+window.__theme.resolve('system')+'.'
+      : 'Always '+ap+', regardless of your device setting.'}</div>
+
+    <div class="grouphead">Currency</div>
+    <div class="group">
+      <div class="field"><label>Primary currency</label>
+        <select onchange="withSync(()=>{S.settings.primary=this.value});render()">
+          ${['MVR','INR'].map(c=>`<option ${S.settings.primary===c?'selected':''}>${c}</option>`).join('')}</select></div>
+      <div class="field"><label style="flex:1">Show conversion hints</label>
+        <div class="toggle ${S.settings.hints?'on':''}" onclick="withSync(()=>{S.settings.hints=!S.settings.hints});render()"><i></i></div></div>
+    </div>
+    <div class="groupfoot">Primary currency only decides which total appears first. Balances are never converted or merged.</div>
+
+    <div class="grouphead">Budgets &amp; alerts</div>
+    <div class="group">
+      <div class="field tap" onclick="push('budgets',{})">
+        <label style="flex:1">Category limits</label>
+        <span style="font-size:16px;color:var(--txt3)">${budgetsFor().length} set</span>
+        <span class="chev">›</span></div>
+      <div class="field tap" onclick="push('alerts',{})">
+        <label style="flex:1">Notifications</label>
+        <span style="font-size:16px;color:var(--txt3)">${unreadAlerts()?unreadAlerts()+' new':(alertsCfg().os?'System on':'In-app')}</span>
+        <span class="chev">›</span></div>
+      <div class="field tap" onclick="push('widget',{})">
+        <label style="flex:1">Home screen widget</label>
+        <span style="font-size:16px;color:var(--txt3)">Set up</span>
+        <span class="chev">›</span></div>
+    </div>
+    <div class="groupfoot">Set a monthly cap per category and Faisaa tells you once at 80% and once when it's exceeded.</div>
+
+    <div class="grouphead">Automation</div>
+    <div class="group">
+      <div class="field tap" onclick="push('recurring',{})">
+        <label style="flex:1">Recurring items</label>
+        <span style="font-size:16px;color:var(--txt3)">${(S.recurring||[]).filter(r=>r.active).length} active</span>
+        <span class="chev">›</span></div>
+      <div class="field tap" onclick="openSheet('transfer')">
+        <label style="flex:1">New transfer</label><span class="chev">›</span></div>
+    </div>
+    <div class="groupfoot">Recurring items post automatically on their day each month, including any months you missed.</div>
+
+    <div class="grouphead">Exchange rates</div>
+    <div class="group"><div class="field tap" onclick="openSheet('rate')">
+      <label style="flex:1">Manual rates</label>
+      <span style="font-size:16px;color:var(--txt3);letter-spacing:-.3px">${p?`1 INR = ${p.rate} MVR`:'None'}</span>
+      <span class="chev">›</span></div></div>
+
+    <div class="grouphead">Sync &amp; devices</div>
+    <div class="group">
+      <div class="field"><label style="flex:1">Status</label>
+        <span id="syncStatusLine" style="font-size:15px;color:var(--txt3);text-align:right">…</span></div>
+      <div class="field"><label style="flex:1">This device</label>
+        <input value="${Sync.deviceName}" style="max-width:150px"
+          onchange="Sync.setName(this.value);toast('ok','Renamed to '+this.value)"></div>
+      <div class="field"><label style="flex:1">Pending changes</label>
+        <span style="font-size:16px;color:var(--txt3)">${Sync.outbox.length}</span></div>
+      ${Sync.peerNames.length?`<div class="field"><label style="flex:1">Also connected</label>
+        <span style="font-size:15px;color:var(--txt3)">${Sync.peerNames.join(', ')}</span></div>`:''}
+    </div>
+    <div class="groupfoot">Changes save on this device instantly and sync to your other devices in real time.
+      Anything made offline is queued and sent automatically when you reconnect.</div>
+
+    <div class="grouphead">Developer</div>
+    <div class="group">
+      <div class="field tap" onclick="toggleOffline()"><label style="flex:1">Simulate offline mode</label>
+        <div class="toggle ${S.offline?'on':''}"><i></i></div></div>
+      <div class="field tap" onclick="wipeAccounts()"><label style="flex:1;color:var(--inr)">Delete all accounts (empty state)</label></div>
+      <div class="field tap" onclick="resetData()"><label style="flex:1;color:var(--inr)">Reset demo data</label></div>
+    </div>
+    <div class="groupfoot">Test-harness controls for exercising edge cases: offline queueing, empty states, and validation.</div>
+    <div style="height:14px"></div>`;
+}
+
+/* ---- PUSHED ROUTES ---- */
+function routeTitle(t){
+  if(t.route==='acct') return (acct(t.data.id)||{}).name||'Account';
+  if(t.route==='txn') return 'Transaction';
+  if(t.route==='list') return t.data.cur?t.data.cur+' Activity':'All Activity';
+  if(t.route==='track') return 'Spend';
+  if(t.route==='recurring') return 'Recurring';
+  if(t.route==='month') return S.ui.reportMonth.toLocaleDateString('en',{month:'long',year:'numeric'});
+  if(t.route==='budgets') return 'Budgets';
+  if(t.route==='alerts') return 'Alerts';
+  if(t.route==='widget') return 'Home screen';
+  return '';
+}
+function routeAction(t){
+  if(t.route==='acct') return `<button class="navbtn" onclick="openSheet('editAcct',{id:'${t.data.id}'})" style="font-size:20px">⋯</button>`;
+  if(t.route==='recurring') return `<button class="navbtn" onclick="openSheet('newRec')">+</button>`;
+  if(t.route==='budgets') return `<button class="navbtn" onclick="openSheet('newBudget')">+</button>`;
+  if(t.route==='alerts') return unreadAlerts()?`<button class="navbtn" style="font-size:15px;font-weight:600" onclick="markAlertsRead()">Mark all</button>`:'';
+  return '';
+}
+function routeBody(t){
+  if(t.route==='acct') return vAcctDetail(t.data.id);
+  if(t.route==='txn') return vTxnDetail(t.data.id);
+  if(t.route==='list') return vList(t.data.cur);
+  if(t.route==='track') return vTracker(t.data.id);
+  if(t.route==='recurring') return vRecurring();
+  if(t.route==='month') return vList(t.data.cur,true);
+  if(t.route==='budgets') return vBudgets(t.data&&t.data.cur);
+  if(t.route==='alerts') return vAlerts();
+  if(t.route==='widget') return vWidget();
+  return '';
+}
+
+/* ---- QUICK ADD DEEP LINKS ---- */
+/* iOS will not let a website install a native home-screen widget, so Faisaa
+   exposes a URL that opens straight into a pre-filled entry sheet. That URL is
+   what a Shortcuts widget, a Lock Screen widget or Back Tap (double-tap the
+   back of the iPhone) is pointed at — one tap, entry sheet already open.
+   Everything is optional; no parameters still opens a blank expense. */
+
+function quickLink(opts){
+  const o=opts||{};
+  const base=location.origin+location.pathname;
+  const p=[];
+  p.push('quick='+(o.kind||'expense'));
+  if(o.amount) p.push('amount='+encodeURIComponent(o.amount));
+  if(o.cat)    p.push('cat='+encodeURIComponent(o.cat));
+  if(o.note)   p.push('note='+encodeURIComponent(o.note));
+  if(o.acct)   p.push('acct='+encodeURIComponent(o.acct));
+  return base+'?'+p.join('&');
+}
+
+/* Read the deep-link parameters once the app is ready and open the sheet. */
+let _quickHandled=null;
+function handleQuickLink(){
+  let q='';
+  try{ q=(location.search||'').replace(/^\?/,''); }catch(_){}
+  const hash=(location.hash||'').replace(/^#/,'');
+  if(!q&&hash.includes('quick=')) q=hash;
+  if(!q) return false;
+  const params={};
+  q.split('&').forEach(kv=>{ const [k,v]=kv.split('='); if(k) params[decodeURIComponent(k)]=decodeURIComponent(v||''); });
+  const kind=params.quick;
+  if(!kind) return false;
+  if(_quickHandled===location.href) return false;
+  _quickHandled=location.href;
+
+  if(!active().length){ openSheet('newAcct'); return true; }
+
+  if(kind==='transfer'){ openSheet('transfer'); return true; }
+  if(kind==='budget'){
+    const c=S.ui.budgetCur||S.settings.primary||'MVR';
+    openSheet(params.cat?'editBudget':'newBudget', params.cat?{id:(budgetOf(params.cat,c)||{}).id}:{cat:params.cat,cur:c});
+    return true;
+  }
+  const dir=kind==='income'?'credit':'debit';
+  // Prefer an account in the currency the link implies (MVR by default).
+  let a=params.acct?acct(params.acct):null;
+  if(!a){
+    const want=params.cur||S.settings.primary||'MVR';
+    a=acctsIn(want)[0]||active()[0];
+  }
+  openSheet('newTxn',{
+    dir,
+    acct:a&&a.id,
+    cat:params.cat||(dir==='credit'?'c9':'c1'),
+    note:params.note||''
+  });
+  // Amount is set after the sheet exists so the parser sees the right currency.
+  if(params.amount){
+    sheetState.form.amount=params.amount;
+    renderSheet();
+  }
+  return true;
+}
+try{
+  addEventListener('hashchange',()=>{ if(handleQuickLink()) render(); });
+}catch(_){}
+
+/* ---- BUDGETS ---- */
+/* The whole screen is one currency at a time, switching with the same segmented
+   control Reports uses — limits live per currency because spending does. */
+function vBudgets(cur){
+  cur=cur||S.settings.primary||'MVR';
+  S.ui.budgetCur=cur;
+  const c=CUR[cur],now=new Date();
+  const seg=`<div class="seg">${['MVR','INR'].map(x=>
+    `<button class="${cur===x?'on':''}" onclick="setBudgetCur('${x}')">${CUR[x].flag} ${x}</button>`).join('')}</div>
+    <div style="font-size:12px;color:var(--txt4);text-align:center;margin:9px 0 18px;letter-spacing:-.1px">A limit only counts spending in its own currency.</div>`;
+
+  if(!acctsIn(cur).length) return seg+`<div class="empty"><div class="g">🎯</div><h3>No ${cur} accounts</h3>
+    <p>Add a ${c.name} account before setting ${cur} limits.</p>
+    <button class="btn" onclick="openSheet('newAcct')">Add account</button></div>`;
+
+  const {rows,limit,spent}=budgetRows(cur,now);
+  const pct=limit?Math.min(spent/limit,1)*100:0;
+  const overTotal=Math.max(spent-limit,0);
+
+  const summary=rows.length?`<div class="card big pad" style="margin-bottom:18px">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:10px">
+        <div><div style="font-size:12.5px;color:var(--txt3);margin-bottom:3px">${now.toLocaleDateString('en',{month:'long'})} budget</div>
+          <div style="font-size:27px;font-weight:700;letter-spacing:-.9px;font-variant-numeric:tabular-nums">${fmt(spent,cur)}</div>
+          <div style="font-size:12.5px;color:var(--txt3);margin-top:2px">of ${fmt(limit,cur)} across ${rows.length} categor${rows.length===1?'y':'ies'}</div></div>
+        <span class="limitchip ${overTotal?'over':(pct>=80?'near':'')}">${overTotal?'over':Math.round(pct)+'% used'}</span>
+      </div>
+      <div class="track" style="margin-top:13px;height:8px"><i style="width:${pct}%;background:${overTotal?'var(--red)':c.color}"></i></div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--txt3);margin-top:7px">
+        <span>${overTotal?`${fmt(overTotal,cur)} over your limits`:`${fmt(limit-spent,cur)} still available`}</span>
+        <span>resets 1 ${new Date(now.getFullYear(),now.getMonth()+1,1).toLocaleDateString('en',{month:'short'})}</span></div>
+    </div>`:'';
+
+  const set=rows.map(r=>`
+    <div class="bud ${r.level==='over'?'over':''}" onclick="openSheet('editBudget',{id:'${r.b.id}'})">
+      <div class="top">
+        <span class="ic" style="background:${r.category.color}26;color:${r.category.color}">${r.category.icon}</span>
+        <div class="nm"><b>${r.category.name}</b>
+          <span>${fmt(r.spent,cur)} of ${fmt(r.b.limit,cur)} · ${Math.round(r.pct*100)}%</span></div>
+        <div class="amt">
+          <b class="${r.level==='over'?'over':(r.level==='near'?'near':'')}">${r.remaining<0?'−'+fmt(-r.remaining,cur):fmt(r.remaining,cur)}</b>
+          <i>${r.remaining<0?'over':'left'}</i></div>
+      </div>
+      <div class="track"><i style="width:${Math.min(r.pct,1)*100}%;background:${r.level==='over'?'var(--red)':r.level==='near'?'var(--orange)':r.category.color}"></i></div>
+      ${r.level==='over'?`<div style="font-size:12px;color:var(--red);margin-top:7px">⚠ Limit exceeded — you were notified</div>`
+        :r.level==='near'?`<div style="font-size:12px;color:var(--orange);margin-top:7px">Close to the limit — notified at 80%</div>`:''}
+    </div>`).join('');
+
+  const free=CATS.filter(x=>x.flow!=='income'&&!x.system&&!budgetOf(x.id,cur));
+  const add=free.length?`<div class="grouphead">Set a limit</div>
+    <div class="card">${free.map(x=>`
+      <div class="row" onclick="openSheet('newBudget',{cat:'${x.id}',cur:'${cur}'})">
+        <span class="ic" style="background:${x.color}26;color:${x.color}">${x.icon}</span>
+        <div class="mid"><b>${x.name}</b><span>No ${cur} limit yet</span></div>
+        <span class="chev">›</span></div>`).join('')}</div>`:'';
+
+  return seg+summary+`<div class="grouphead">${rows.length?'Your limits':'Your limits'}</div>`
+    + (rows.length?`<div class="card">${set}</div>`
+      :`<div class="card"><div class="empty" style="padding:38px 22px"><div class="g">🎯</div><h3>No limits yet</h3>
+        <p>Cap a category for the month. When spending crosses 80% and 100% of the cap, Faisaa tells you once.</p></div></div>`)
+    + add
+    + `<div class="groupfoot">Limits reset on the 1st of every month. You're notified once at 80% and once at 100% — never repeatedly.</div>
+       <div style="height:14px"></div>`;
+}
+function setBudgetCur(c){ S.ui.budgetCur=c; render(); }
+
+function vAlerts(){
+  const list=(S.alerts||[]);
+  const cfg=alertsCfg();
+  const head=`<div class="group">
+      <div class="field"><label style="flex:1">Budget alerts</label>
+        <div class="toggle ${cfg.budgets?'on':''}" onclick="withSync(()=>{alertsCfg().budgets=!alertsCfg().budgets});render()"><i></i></div></div>
+      <div class="field tap" onclick="requestOS()">
+        <label style="flex:1">System notifications</label>
+        <span style="font-size:15px;color:var(--txt3)">${osPermission()==='granted'?(cfg.os?'On':'Off'):osPermission()==='denied'?'Blocked in Settings':'Ask'}</span>
+        <span class="chev">›</span></div>
+    </div>
+    <div class="groupfoot">In-app alerts always land here. Turn on system notifications to be told even while Faisaa is closed.</div>`;
+
+  if(!list.length) return head+`<div class="empty"><div class="g">🔔</div><h3>No alerts yet</h3>
+    <p>Set a limit on a category and you'll be told the moment spending crosses it.</p>
+    <button class="btn" onclick="push('budgets',{})">Set a limit</button></div>`;
+
+  const rows=list.map(a=>{
+    const copy=budAlert(a);
+    return `<div class="alertrow ${a.kind==='over'?'':'warn'} ${a.read?'':'unread'}">
+      <span class="ic">${a.kind==='over'?'⚠':'🔔'}</span>
+      <div class="mid"><b>${copy.title}</b><span>${copy.body}</span>
+        <span style="color:var(--txt4);margin-top:3px">${new Date(a.at).toLocaleString('en',{dateStyle:'medium',timeStyle:'short'})}</span></div>
+      ${a.read?'':'<span style="width:8px;height:8px;border-radius:50%;background:var(--inr);flex:0 0 8px;margin-top:14px"></span>'}
+    </div>`}).join('');
+
+  return head+`<div class="grouphead">Recent</div><div class="card">${rows}</div>
+    <div style="text-align:center;margin-top:16px">
+      <button class="btn sec2" style="font-size:15px;padding:11px 20px" onclick="clearAlerts()">Clear all alerts</button></div>
+    <div style="height:14px"></div>`;
+}
+function markAlertsRead(){ withSync(()=>{(S.alerts||[]).forEach(a=>a.read=true)}); render(); }
+function clearAlerts(){ withSync(()=>{S.alerts=[]}); render(); toast('info','Alerts cleared'); }
+function requestOS(){
+  const cfg=alertsCfg();
+  if(osPermission()==='unsupported'){ toast('info','Add Faisaa to your Home Screen to allow notifications'); return; }
+  if(osPermission()==='granted'){ withSync(()=>{cfg.os=!cfg.os}); render();
+    toast('ok',cfg.os?'System notifications on':'System notifications off'); return; }
+  try{
+    Notification.requestPermission().then(p=>{
+      if(p==='granted'){ withSync(()=>{cfg.os=true}); toast('ok','Notifications on'); }
+      else toast('info','Allow notifications in Settings to use this');
+      render();
+    });
+  }catch(_){ toast('info','Notifications are not available here'); }
+}
+
+/* ---- HOME SCREEN / WIDGET SETUP ---- */
+function vWidget(){
+  const link=quickLink({kind:'expense'});
+  const inc=quickLink({kind:'income'});
+  const budgets=quickLink({kind:'budget'});
+  return `<div class="card big pad" style="margin-bottom:18px;text-align:center">
+      <div style="font-size:40px;line-height:1">📲</div>
+      <h3 style="margin:9px 0 6px;font-size:19px;letter-spacing:-.4px">Add money in one tap</h3>
+      <p style="margin:0;font-size:14px;color:var(--txt3);line-height:1.45;letter-spacing:-.2px">
+        Faisaa is a website, so iOS can't give it a native widget. Instead, these links open the
+        entry sheet instantly — even from a widget or a double-tap on the back of your iPhone.</p>
+    </div>
+
+    <div class="grouphead">1 · Back Tap (double-tap the back)</div>
+    <ol class="steps card" style="border-radius:12px;overflow:hidden">
+      <li><em>1</em>Open <b>Settings → Accessibility → Touch → Back Tap</b>.</li>
+      <li><em>2</em>Choose <b>Double Tap</b>, then <b>Shortcuts</b> → <b>Open “Add expense”</b>.</li>
+      <li><em>3</em>Create that shortcut once in the Shortcuts app (step 3 below) and it's ready everywhere.</li>
+    </ol>
+
+    <div class="grouphead">2 · Widget on the Home Screen</div>
+    <ol class="steps card" style="border-radius:12px;overflow:hidden">
+      <li><em>1</em>In <b>Shortcuts</b>, make a shortcut named <b>Add expense</b> with a single action:
+        <b>Open URLs</b>.</li>
+      <li><em>2</em>Paste the expense link below as that URL.</li>
+      <li><em>3</em>Long-press the Home Screen → <b>+</b> → <b>Shortcuts</b> → choose the widget size,
+        then pick the <b>Add expense</b> shortcut.</li>
+      <li><em>4</em>Tapping the widget opens Faisaa with the expense sheet already up.</li>
+    </ol>
+
+    <div class="grouphead">Expense link</div>
+    <div class="linkbox"><code>${esc(link)}</code>
+      <button onclick="copyLink('${esc(link)}')">Copy</button></div>
+
+    <div class="grouphead">Income link</div>
+    <div class="linkbox"><code>${esc(inc)}</code>
+      <button onclick="copyLink('${esc(inc)}')">Copy</button></div>
+
+    <div class="grouphead">Set a limit link</div>
+    <div class="linkbox"><code>${esc(budgets)}</code>
+      <button onclick="copyLink('${esc(budgets)}')">Copy</button></div>
+
+    <div class="grouphead">Pre-fill anything</div>
+    <div class="groupfoot" style="margin-bottom:8px">Add parameters to skip a step in the sheet. Everything after
+      <b>?</b> is optional.</div>
+    <div class="group"><div class="field" style="align-items:flex-start">
+      <code style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--txt2);line-height:1.7;white-space:pre-wrap">?quick=expense
+&amp;amount=120
+&amp;cat=c3
+&amp;note=Ferry%20to%20Male</code></div></div>
+    <div class="groupfoot"><b>quick</b> expense · income · transfer · budget &nbsp;·&nbsp;
+      <b>cat</b> from the category list &nbsp;·&nbsp; <b>note</b> and <b>amount</b> are free text.</div>
+
+    <div class="note blue" style="margin-top:18px">ⓘ Links open the app for the moment; nothing is saved
+      until you tap <b>Save</b>, so you can still change the account, category or note.</div>
+    <div style="height:14px"></div>`;
+}
+function copyLink(url){
+  const done=()=>toast('ok','Link copied');
+  try{
+    if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done).catch(fallback);
+    else fallback();
+  }catch(_){ fallback(); }
+  function fallback(){
+    try{
+      const ta=document.createElement('textarea');ta.value=url;ta.style.position='fixed';ta.style.opacity='0';
+      document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done();
+    }catch(_){ toast('info','Long-press the link to copy it'); }
+  }
+}
+
+function vAcctDetail(id){
+  const a=acct(id); if(!a) return `<div class="empty"><div class="g">❓</div><h3>Account not found</h3><p>It may have been deleted.</p></div>`;
+  const b=balance(id),cu=CUR[a.currency];
+  const ts=S.txns.filter(t=>t.accountId===id);
+  return `<div class="card big" style="text-align:center;padding:28px 16px;margin-bottom:18px">
+      <span class="badge ${cu.cls}">${cu.flag} ${a.currency}</span>
+      <div style="font-size:38px;font-weight:700;letter-spacing:-1.4px;margin:10px 0 5px;font-variant-numeric:tabular-nums;${b<0?'color:var(--red)':''}">${fmt(b,a.currency)}</div>
+      <div style="font-size:14px;color:var(--txt3)">${[a.inst,KINDS[a.kind].l,a.mask?'•••• '+a.mask:''].filter(Boolean).join(' · ')}</div>
+      <div style="font-size:12px;color:var(--txt4);margin-top:4px">Opening ${fmt(a.opening,a.currency)}</div></div>
+    <div style="display:flex;gap:10px;margin-bottom:18px">
+      <button class="btn ${cu.cls==='mvr'?'mvr':''}" style="flex:1" onclick="openSheet('newTxn',{acct:'${id}'})">+ Add</button>
+      <button class="btn sec2" style="flex:1;color:${cu.color}" onclick="push('track',{id:'${id}'})">− Spend</button></div>
+    ${ts.length?`<div class="card">${ts.map(x=>txnRow(x,true)).join('')}</div>`
+      :`<div class="card"><div class="empty" style="padding:38px 16px"><div class="g">🗂</div><h3>No activity</h3>
+        <p>Transactions for this account appear here.</p>
+        <button class="btn" onclick="openSheet('newTxn',{acct:'${id}'})">Add transaction</button></div></div>`}
+    <button class="btn plain wide" style="margin-top:22px" onclick="openSheet('delAcct',{id:'${id}'})">Delete Account</button>
+    <div style="height:10px"></div>`;
+}
+
+function vTxnDetail(id){
+  const t=S.txns.find(x=>x.id===id);
+  if(!t) return `<div class="empty"><div class="g">❓</div><h3>Not found</h3><p>This transaction was deleted.</p></div>`;
+  const a=acct(t.accountId),c=cat(t.categoryId),cu=CUR[t.currency];
+  return `<div class="card big" style="text-align:center;padding:26px 16px;margin-bottom:8px">
+      <div style="font-size:36px;font-weight:700;letter-spacing:-1.3px;font-variant-numeric:tabular-nums;${t.dir==='credit'?'color:var(--green)':''}">
+        ${t.dir==='debit'?'−':'+'}${fmt(t.amount,t.currency)}</div>
+      <div style="margin-top:10px"><span class="badge ${cu.cls}">${cu.flag} ${t.currency}</span></div>
+      ${t.fx?`<div style="font-size:12px;color:var(--txt4);margin-top:10px">≈ ${fmt(t.fx.converted,t.fx.quote)} at 1 ${t.fx.base} = ${t.fx.rate} ${t.fx.quote}</div>
+        <div style="font-size:10.5px;color:var(--txt4);margin-top:3px">Reference only — not included in any total</div>`:''}</div>
+    <div class="group">
+    ${[['Account',a?esc(a.name):'—'],['Category',c.name],['Date',new Date(t.at).toLocaleString('en',{dateStyle:'medium',timeStyle:'short'})],
+       ['Merchant',esc(t.merchant)||'—'],['Sync',t.sync==='synced'?'✓ Synced':'↻ Pending']]
+      .map(([k,v])=>`<div class="field"><label style="flex:1">${k}</label><span style="font-size:16px;color:var(--txt3);letter-spacing:-.3px;text-align:right;min-width:0">${v}</span></div>`).join('')}
+    </div>
+    ${t.note?`<div class="grouphead">Note</div>
+      <div class="card" style="padding:13px 16px;font-size:15px;color:var(--txt);line-height:1.42;letter-spacing:-.2px">📝 ${esc(t.note)}</div>`:''}
+    ${t.recurringId?`<div class="note" style="margin-top:14px">↻ Posted automatically by a recurring item.</div>`:''}
+    ${t.transferId?transferPairNote(t):''}
+    <div style="display:flex;gap:10px;margin-top:20px">
+      ${t.transferId?'':`<button class="btn sec2" style="flex:1" onclick="openSheet('editTxn',{id:'${id}'})">Edit</button>`}
+      <button class="btn danger" style="flex:1" onclick="delTxn('${id}')">${t.transferId?'Delete Transfer':'Delete'}</button></div>`;
+}
+
+function vRecurring(){
+  const list=(S.recurring||[]).slice().sort((a,b)=>nextDue(a)-nextDue(b));
+  if(!list.length) return `<div class="empty"><div class="g">↻</div><h3>No recurring items</h3>
+    <p>Schedule rent, salary, or subscriptions and they'll post automatically each month.</p>
+    <button class="btn" onclick="openSheet('newRec')">Add recurring item</button></div>`;
+
+  const sum=cur=>{
+    const rs=list.filter(r=>r.currency===cur&&r.active);
+    if(!rs.length) return '';
+    const out=rs.filter(r=>r.dir==='debit').reduce((s,r)=>s+r.amount,0);
+    const inn=rs.filter(r=>r.dir==='credit').reduce((s,r)=>s+r.amount,0);
+    return `<div class="card sm" style="flex:1">
+      <div class="h" style="color:${CUR[cur].color}">${CUR[cur].flag} ${cur} / month</div>
+      <div class="v">${inn?'+'+compact(inn,cur):''}${inn&&out?' · ':''}${out?'−'+compact(out,cur):''}</div></div>`;
+  };
+  const sums=[sum('INR'),sum('MVR')].filter(Boolean).join('');
+
+  return `${sums?`<div class="summaries">${sums}</div>`:''}
+    <div class="card">${list.map(r=>{
+      const a=acct(r.accountId),c=cat(r.categoryId),d=daysUntil(nextDue(r));
+      const gone=!a;
+      return `<div class="recrow ${r.active&&!gone?'':'off'}" onclick="openSheet('editRec',{id:'${r.id}'})">
+        <span class="ic" style="background:${c.color}26;color:${c.color}">${c.icon}</span>
+        <div class="mid"><b>${r.name}</b>
+          <span>${gone?'Account deleted — paused':
+            `${ordinal(r.day)} monthly · ${a.name}`}</span></div>
+        <div class="amt">
+          <div style="font-size:15.5px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.3px;
+                      white-space:nowrap;${r.dir==='credit'?'color:var(--green)':''}">
+            ${r.dir==='debit'?'−':'+'}${fmt(r.amount,r.currency)}</div>
+          <div>${r.active&&!gone
+            ? `<span class="duepill ${d<=3?'soon':''}">${dueLabel(r)}</span>`
+            : `<span class="duepill" style="background:var(--fill);color:var(--txt3)">Paused</span>`}</div>
+        </div>
+        <div class="toggle ${r.active&&!gone?'on':''}" style="transform:scale(.72);margin-left:2px"
+             onclick="toggleRec('${r.id}',event)"><i></i></div>
+      </div>`}).join('')}</div>
+
+    <button class="btn sec2 wide" style="margin-top:18px" onclick="openSheet('newRec')">+ Add Recurring Item</button>
+    <button class="btn plain wide" style="margin-top:8px;color:var(--inr)" onclick="runRecurringNow()">Check for due items now</button>
+    <div class="groupfoot" style="margin-top:10px;text-align:center">Items post automatically when due. Missed months are
+      caught up the next time you open the app — never twice for the same month.</div>
+    <div style="height:14px"></div>`;
+}
+
+function transferPairNote(t){
+  const other=S.txns.find(x=>x.transferId===t.transferId&&x.id!==t.id);
+  if(!other) return '';
+  const oa=acct(other.accountId);
+  const cross=other.currency!==t.currency;
+  return `<div class="note blue" style="margin-top:14px">⇄ Part of a transfer.
+    The matching entry is ${other.dir==='debit'?'−':'+'}${fmt(other.amount,other.currency)} on ${oa?oa.name:'a deleted account'}.
+    ${cross?`Each leg stays in its own currency — the ${t.currency} and ${other.currency} totals are never combined.`:''}
+    Deleting one removes both.</div>`;
+}
+
+function vList(cur,monthOnly){
+  let items=S.txns.filter(t=>!cur||t.currency===cur);
+  if(monthOnly) items=items.filter(t=>sameMonth(t.at,new Date()));
+  if(!items.length) return `<div class="empty"><div class="g">🔍</div><h3>Nothing found</h3><p>No transactions here yet.</p></div>`;
+  return `<div class="card">${items.map(t=>txnRow(t)).join('')}</div>`;
+}
+
+/* ---- SPENDING TRACKER ---- */
+let TR={amount:'',cat:'c1',merchant:'',note:'',err:null};
+function vTracker(id){
+  const a=acct(id); if(!a) return '<div class="empty"><div class="g">❓</div><h3>Account not found</h3></div>';
+  const cur=a.currency,c=CUR[cur],bal=balance(id);
+  const p=parseAmount(TR.amount,cur),amt=p.minor||0;
+  const remaining=bal-amt, over=remaining<0&&bal>=0;
+  const pct=bal>0?Math.min(amt/bal,1):0;
+
+  return `<div class="card big gauge" style="margin-bottom:16px">
+      <div class="gwrap">${gaugeSVG(pct,over?'#FF3B30':c.color)}
+        <div class="gcenter"><div class="l">Remaining</div>
+          <div class="v ${remaining<0?'neg':''}">${fmt(remaining,cur)}</div>
+          <span class="badge ${c.cls}">${cur}</span></div></div>
+      <div class="gstats">
+        <div class="s"><i>Now</i><b>${fmt(bal,cur)}</b></div><div class="div"></div>
+        <div class="s"><i>Spending</i><b>${amt?fmt(amt,cur):'—'}</b></div></div>
+      <div style="font-size:13px;color:var(--txt3);margin-top:14px">${a.name}</div></div>
+
+    <div class="amountbox" style="margin-bottom:14px">
+      <div class="amountrow"><span class="sym">${c.sym}</span>
+        <input id="trAmt" inputmode="decimal" placeholder="0.00" value="${TR.amount}" oninput="TR.amount=this.value;TR.err=null;softTracker()"></div>
+      <div style="display:flex;gap:8px;margin-top:14px;align-items:center">
+        ${[10,50,100,500].map(q=>`<button class="chip" style="background:var(--fill);color:var(--txt)" onclick="bump(${q})">+${q}</button>`).join('')}
+        <button style="margin-left:auto;background:none;border:none;color:var(--txt3);font-size:13.5px;cursor:pointer;font-family:inherit" onclick="TR.amount='';render()">Clear</button></div></div>
+
+    <div class="chips">${CATS.filter(x=>x.flow!=='income').map(x=>
+      `<button class="chip" style="background:${x.color}${TR.cat===x.id?'':'26'};color:${TR.cat===x.id?'#fff':x.color}"
+        onclick="TR.cat='${x.id}';render()">${x.icon} ${x.name}</button>`).join('')}</div>
+
+    <div class="group">
+      <div class="field"><input placeholder="Merchant (optional)" value="${TR.merchant}"
+        oninput="TR.merchant=this.value" style="text-align:left"></div>
+      <div class="field"><input placeholder="Note — what was it for?" value="${esc(TR.note||'')}"
+        maxlength="240" oninput="TR.note=this.value" style="text-align:left"></div>
+    </div>
+    ${TR.err?`<div class="err">⚠ ${TR.err}</div>`:''}
+    ${over?`<div class="note warn" style="margin:14px 0">⚠ This leaves ${a.name} at ${fmt(remaining,cur)}. You can still record it — the app won't block you, but it will confirm first.</div>`:''}
+    <button class="btn wide ${over?'danger':(c.cls==='mvr'?'mvr':'')}" style="margin-top:16px" ${amt?'':'disabled'} onclick="doSpend('${id}')">
+      ${amt?'Deduct '+fmt(amt,cur):'Enter an amount'}</button>
+    <div style="height:10px"></div>`;
+}
+function softTracker(){
+  const id=S.ui.stack[S.ui.stack.length-1].data.id,a=acct(id),cur=a.currency,c=CUR[cur];
+  const bal=balance(id),p=parseAmount(TR.amount,cur),amt=p.minor||0;
+  const remaining=bal-amt,over=remaining<0&&bal>=0,pct=bal>0?Math.min(amt/bal,1):0;
+  const g=document.querySelector('.gwrap');
+  if(g){g.innerHTML=gaugeSVG(pct,over?'#FF3B30':c.color)+
+    `<div class="gcenter"><div class="l">Remaining</div><div class="v ${remaining<0?'neg':''}">${fmt(remaining,cur)}</div>
+     <span class="badge ${c.cls}">${cur}</span></div>`;}
+  const st=document.querySelectorAll('.gstats .s b');
+  if(st[1]) st[1].textContent=amt?fmt(amt,cur):'—';
+  const btn=document.querySelector('.btn.wide');
+  if(btn){btn.disabled=!amt;btn.textContent=amt?'Deduct '+fmt(amt,cur):'Enter an amount';
+    btn.className='btn wide '+(over?'danger':(c.cls==='mvr'?'mvr':''));btn.style.marginTop='16px';}
+}
+function bump(q){const cur=acct(S.ui.stack[S.ui.stack.length-1].data.id).currency;
+  const p=parseAmount(TR.amount,cur);TR.amount=(((p.minor||0)/100)+q).toString();render();}
+function doSpend__inner(id){
+  const a=acct(id),p=parseAmount(TR.amount,a.currency);
+  if(p.err){TR.err=p.err;render();return}
+  const bal=balance(id);
+  if(bal-p.minor<0&&bal>=0){
+    if(!confirm(`This leaves ${a.name} at ${fmt(bal-p.minor,a.currency)}. Record it anyway?`)) return;
+  }
+  S.txns.unshift({id:uid(),accountId:id,currency:a.currency,amount:p.minor,dir:'debit',categoryId:TR.cat,
+    merchant:TR.merchant||null,note:(TR.note||'').trim()||null,
+    at:new Date().toISOString(),sync:S.offline?'pendingCreate':'synced',fx:null});
+  enqueue('transaction','create');
+  const rem=balance(id);
+  toast(S.offline?'info':'ok',S.offline?'Saved offline — will sync later':`${fmt(p.minor,a.currency)} · ${a.name} → ${fmt(rem,a.currency)}`);
+  TR={amount:'',cat:TR.cat,merchant:'',note:'',err:null};render();
+  checkBudgets();
+}
+
+function delTxn__inner(id){
+  const t=S.txns.find(x=>x.id===id);
+  if(!t) return;
+  if(t.transferId){
+    // Both legs go together — a half transfer would leave one ledger wrong.
+    const legs=deleteTransfer(t.transferId);
+    pop();
+    toast('info','Transfer deleted (both entries)',()=>{
+      withSync(()=>{legs.forEach(l=>S.txns.push(l));
+        S.txns.sort((x,y)=>new Date(y.at)-new Date(x.at));});render();});
+    return;
+  }
+  const i=S.txns.indexOf(t);
+  S.txns.splice(i,1);enqueue('transaction','delete');pop();
+  checkBudgets();   // deleting spend can drop a category back under its limit
+  toast('info','Transaction deleted',()=>{withSync(()=>{S.txns.splice(i,0,t)});render()});
+}
+
+/* ============ SHEETS ============ */
+function renderSheet(){
+  const k=sheetState.kind,f=sheetState.form;
+  const head=document.getElementById('sheetHead'),body=document.getElementById('sheetBody');
+
+  if(k==='newTxn'||k==='editTxn'){
+    if(!active().length){
+      head.innerHTML=`<button onclick="closeSheet()">Cancel</button><span class="t">New Transaction</span><span style="min-width:58px"></span>`;
+      body.innerHTML=`<div class="empty"><div class="g">💳</div><h3>No accounts yet</h3>
+        <p>You need at least one account before recording a transaction.</p>
+        <button class="btn" onclick="closeSheet();setTimeout(()=>openSheet('newAcct'),440)">Add an account</button></div>`;
+      return;
+    }
+    const a=acct(f.acct)||active()[0],cur=a.currency,c=CUR[cur],other=cur==='INR'?'MVR':'INR';
+    const p=parseAmount(f.amount,cur);
+    const rr=f.fx?parseRate(f.rate):{rate:null};
+    const conv=(f.fx&&rr.rate&&p.minor)?Math.round(p.minor*rr.rate):null;
+    const pinned=S.rates.find(r=>r.base===cur&&r.quote===other);
+
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button>
+      <span class="t">${k==='editTxn'?'Edit':'New'} Transaction</span>
+      <button class="pri" onclick="saveTxn()">Save</button>`;
+
+    body.innerHTML=`
+      <div class="seg" style="margin:8px 0 14px">
+        <button class="${f.dir==='debit'?'on':''}" onclick="sf('dir','debit')">Expense</button>
+        <button class="${f.dir==='credit'?'on':''}" onclick="sf('dir','credit')">Income</button></div>
+
+      <div class="amountbox"><div class="amountrow"><span class="sym">${c.sym}</span>
+        <input id="txAmt" inputmode="decimal" placeholder="0.00" value="${f.amount}"
+          oninput="sheetState.form.amount=this.value;sheetState.form.errs={};softTxn()"></div></div>
+      ${f.errs.amount?`<div class="err">⚠ ${f.errs.amount}</div>`:''}
+      ${budPreview(f,p)}
+
+      <div class="grouphead">Account</div>
+      ${['INR','MVR'].map(cc=>{
+        const g=active().filter(x=>x.currency===cc); if(!g.length) return '';
+        return `<div style="font-size:13px;font-weight:600;color:var(--txt3);margin:10px 16px 7px">${CUR[cc].flag} ${cc} accounts</div>
+          <div class="card" style="margin-bottom:8px">${g.map(x=>`
+            <div class="row" onclick="sf('acct','${x.id}')">
+              <span class="ic" style="background:${x.color}26;color:${x.color};border-radius:11px">${KINDS[x.kind].i}</span>
+              <div class="mid"><b>${x.name}</b><span>${[x.inst,KINDS[x.kind].l].filter(Boolean).join(' · ')}</span></div>
+              <div class="rt"><span style="font-size:13px;color:var(--txt3);font-variant-numeric:tabular-nums">${fmt(balance(x.id),cc)}</span></div>
+              <span style="color:${f.acct===x.id?CUR[cc].color:'var(--txt4)'};font-size:21px;margin-left:4px">${f.acct===x.id?'◉':'○'}</span>
+            </div>`).join('')}</div>`}).join('')}
+      <div class="note blue" style="margin:10px 0 0">ⓘ Booked in ${cur}. This stays out of your ${other} total — the two ledgers never mix.</div>
+
+      <div class="grouphead">Category</div>
+      <div class="card pad"><div class="cats">${CATS.filter(x=>x.flow==='both'||(x.flow==='expense'&&f.dir==='debit')||(x.flow==='income'&&f.dir==='credit'))
+        .map(x=>`<button class="cat ${f.cat===x.id?'on':''}" onclick="sf('cat','${x.id}')">
+          <span class="ic" style="background:${x.color}${f.cat===x.id?'':'26'};color:${f.cat===x.id?'#fff':x.color}">${x.icon}</span>
+          <span>${x.name}</span></button>`).join('')}</div></div>
+      ${f.errs.cat?`<div class="err">⚠ ${f.errs.cat}</div>`:''}
+
+      <div class="grouphead">Description</div>
+      <div class="group">
+        <div class="field"><input placeholder="Merchant or payee" value="${esc(f.merchant)}" style="text-align:left"
+          oninput="sheetState.form.merchant=this.value"></div>
+        <div class="field" style="align-items:flex-start;padding-bottom:11px">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:16px;letter-spacing:-.3px;margin-bottom:5px">Note</div>
+            <textarea id="txNote" rows="2" placeholder="What exactly was this for?" maxlength="240"
+              style="width:100%;border:none;background:none;font-size:15px;font-family:inherit;outline:none;
+                     color:var(--txt);resize:none;padding:0;line-height:1.38;letter-spacing:-.2px"
+              oninput="sheetState.form.note=this.value">${esc(f.note)}</textarea>
+          </div>
+        </div>
+      </div>
+      ${quickNotes(f)}
+
+      <div class="grouphead">Exchange rate</div>
+      <div class="group">
+        <div class="field"><div style="flex:1"><div style="font-size:16px;letter-spacing:-.3px">Add ${other} reference</div>
+            <div style="font-size:12.5px;color:var(--txt3);margin-top:2px">Display only — never added to totals</div></div>
+          <div class="toggle ${f.fx?'on':''}" onclick="sf('fx',${!f.fx})"><i></i></div></div>
+        ${f.fx?`<div class="field"><label>1 ${cur} =</label>
+          <input inputmode="decimal" placeholder="${pinned?pinned.rate:'0.00'}" value="${f.rate}"
+            oninput="sheetState.form.rate=this.value;sheetState.form.errs={};renderSheet()">
+          <span style="font-size:16px;color:var(--txt3)">${other}</span></div>`:''}
+      </div>
+      ${f.fx?`
+        ${rr.err?`<div class="err">⚠ ${rr.err}</div>`
+          :conv?`<div style="display:flex;justify-content:space-between;font-size:13px;color:var(--txt3);margin:8px 16px 0">
+            <span>≈ ${fmt(conv,other)}</span><span style="color:var(--txt4)">reference only</span></div>`:''}
+        ${pinned?`<button class="btn sec2 wide" style="margin-top:12px;font-size:15px;padding:12px" onclick="sheetState.form.rate='${pinned.rate}';renderSheet()">Use pinned rate (${pinned.rate})</button>`:''}
+      `:''}
+      <div class="groupfoot">Faisaa never converts your balances. A rate only records what this single amount was worth at the time.</div>
+
+      ${(f.dir==='debit'&&p.minor&&balance(f.acct)>=0&&p.minor>balance(f.acct))
+        ? `<div class="note warn" style="margin-top:18px">⚠ ${fmt(p.minor,cur)} exceeds the ${fmt(balance(f.acct),cur)} available in ${a.name}. You can still save it.</div>`:''}
+      ${S.offline?`<div class="note" style="margin-top:12px">You're offline. This is saved on device and synced automatically.</div>`:''}
+      <div style="height:24px"></div>`;
+  }
+
+  else if(k==='transfer'){
+    const list=active();
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button>
+      <span class="t">Transfer</span>
+      <button class="pri" onclick="saveTransfer()">Send</button>`;
+
+    if(list.length<2){
+      body.innerHTML=`<div class="empty"><div class="g">⇄</div><h3>Need two accounts</h3>
+        <p>Transfers move money between two of your accounts. Add one more to get started.</p>
+        <button class="btn" onclick="closeSheet();setTimeout(()=>openSheet('newAcct'),440)">Add account</button></div>`;
+      return;
+    }
+
+    const pv=transferPreview(f.from,f.to,f.amount,f.rate);
+    const from=acct(f.from),to=acct(f.to);
+    const cross=from&&to&&from.currency!==to.currency;
+
+    body.innerHTML=`
+      <div class="card big tvis" style="margin:8px 0 14px">
+        <div class="side">
+          <div class="lb">From</div>
+          <div class="ic" style="background:linear-gradient(135deg,${from.color},${from.color}c0)">${KINDS[from.kind].i}</div>
+          <div class="nm">${from.name}</div>
+          <div class="am" style="color:var(--red)">${pv.out?'−'+fmt(pv.out.minor,pv.out.cur):fmt(0,from.currency)}</div>
+          <div style="margin-top:5px"><span class="badge ${CUR[from.currency].cls}">${from.currency}</span></div>
+        </div>
+        <div class="arrow">
+          <button class="swapbtn" onclick="swapTransfer()">⇅</button>
+          <div class="a">→</div>
+          ${cross&&pv.rate?`<div class="r">×${pv.rate}</div>`:''}
+        </div>
+        <div class="side">
+          <div class="lb">To</div>
+          <div class="ic" style="background:linear-gradient(135deg,${to.color},${to.color}c0)">${KINDS[to.kind].i}</div>
+          <div class="nm">${to.name}</div>
+          <div class="am" style="color:var(--green)">${pv.inn?'+'+fmt(pv.inn.minor,pv.inn.cur):fmt(0,to.currency)}</div>
+          <div style="margin-top:5px"><span class="badge ${CUR[to.currency].cls}">${to.currency}</span></div>
+        </div>
+      </div>
+      ${f.errs.acct?`<div class="err">⚠ ${f.errs.acct}</div>`:''}
+
+      <div class="amountbox"><div class="amountrow"><span class="sym">${CUR[from.currency].sym}</span>
+        <input id="tfAmt" inputmode="decimal" placeholder="0.00" value="${f.amount}"
+          oninput="sheetState.form.amount=this.value;sheetState.form.errs={};softTransfer()"></div></div>
+      ${f.errs.amount?`<div class="err">⚠ ${f.errs.amount}</div>`:''}
+
+      <div class="grouphead">From account</div>
+      <div class="card">${list.map(x=>`
+        <div class="row" onclick="pickTransfer('from','${x.id}')">
+          <span class="ic" style="background:${x.color}26;color:${x.color};border-radius:11px">${KINDS[x.kind].i}</span>
+          <div class="mid"><b>${x.name}</b><span>${x.currency} · ${fmt(balance(x.id),x.currency)}</span></div>
+          <span style="color:${f.from===x.id?CUR[x.currency].color:'var(--txt4)'};font-size:21px">${f.from===x.id?'◉':'○'}</span>
+        </div>`).join('')}</div>
+
+      <div class="grouphead">To account</div>
+      <div class="card">${list.map(x=>{
+        const dis=x.id===f.from;
+        return `<div class="row" style="${dis?'opacity:.35':''}" onclick="${dis?'':`pickTransfer('to','${x.id}')`}">
+          <span class="ic" style="background:${x.color}26;color:${x.color};border-radius:11px">${KINDS[x.kind].i}</span>
+          <div class="mid"><b>${x.name}</b><span>${dis?'source account':x.currency+' · '+fmt(balance(x.id),x.currency)}</span></div>
+          <span style="color:${f.to===x.id?CUR[x.currency].color:'var(--txt4)'};font-size:21px">${f.to===x.id?'◉':'○'}</span>
+        </div>`}).join('')}</div>
+
+      ${cross?`
+        <div class="grouphead">Exchange rate — required</div>
+        <div class="group"><div class="field"><label>1 ${from.currency} =</label>
+          <input inputmode="decimal" placeholder="0.00" value="${f.rate}"
+            oninput="sheetState.form.rate=this.value;sheetState.form.errs={};renderSheet()">
+          <span style="font-size:16px;color:var(--txt3)">${to.currency}</span></div></div>
+        ${f.errs.rate?`<div class="err">⚠ ${f.errs.rate}</div>`:''}
+        ${ratePresets(from.currency,to.currency)}
+        <div class="note blue" style="margin-top:12px">ⓘ This is a cross-currency transfer. It is recorded as
+          <b>two separate entries</b>: ${pv.out?fmt(pv.out.minor,from.currency):'—'} leaves your ${from.currency} total and
+          ${pv.inn?fmt(pv.inn.minor,to.currency):'—'} enters your ${to.currency} total. The two totals are still never combined.</div>
+      `:`<div class="note" style="margin-top:14px">Both accounts are in ${from.currency}, so no exchange rate is needed.</div>`}
+
+      <div class="grouphead">Note</div>
+      <div class="group"><div class="field"><input placeholder="Optional note" value="${f.note||''}" style="text-align:left"
+        oninput="sheetState.form.note=this.value"></div></div>
+
+      ${pv.over?`<div class="note warn" style="margin-top:14px">⚠ This leaves ${from.name} at
+        ${fmt(pv.remaining,from.currency)}. You can still send it.</div>`:''}
+      ${S.offline?`<div class="note" style="margin-top:12px">You're offline. Both legs are saved on device and synced together.</div>`:''}
+      <div style="height:24px"></div>`;
+  }
+
+  else if(k==='newRec'||k==='editRec'){
+    const isEdit=k==='editRec';
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button>
+      <span class="t">${isEdit?'Edit':'New'} Recurring</span>
+      <button class="pri" onclick="saveRec()">Save</button>`;
+
+    if(!active().length){
+      body.innerHTML=`<div class="empty"><div class="g">↻</div><h3>No accounts yet</h3>
+        <p>Recurring items post to an account, so you'll need one first.</p>
+        <button class="btn" onclick="closeSheet();setTimeout(()=>openSheet('newAcct'),440)">Add account</button></div>`;
+      return;
+    }
+    const a=acct(f.acct)||active()[0],cur=a.currency;
+    const preview={day:f.day,account:a};
+    const nd=nextDue({day:f.day});
+
+    body.innerHTML=`
+      <div class="seg" style="margin:8px 0 14px">
+        <button class="${f.dir==='debit'?'on':''}" onclick="sf('dir','debit')">Pay out</button>
+        <button class="${f.dir==='credit'?'on':''}" onclick="sf('dir','credit')">Receive</button></div>
+
+      <div class="amountbox"><div class="amountrow"><span class="sym">${CUR[cur].sym}</span>
+        <input inputmode="decimal" placeholder="0.00" value="${f.amount}"
+          oninput="sheetState.form.amount=this.value;sheetState.form.errs={}"></div></div>
+      ${f.errs.amount?`<div class="err">⚠ ${f.errs.amount}</div>`:''}
+
+      <div class="grouphead">Name</div>
+      <div class="group"><div class="field"><input placeholder="e.g. Rent, Salary, Netflix" value="${f.name||''}"
+        style="text-align:left" oninput="sheetState.form.name=this.value;sheetState.form.errs={}"></div></div>
+      ${f.errs.name?`<div class="err">⚠ ${f.errs.name}</div>`:''}
+
+      <div class="grouphead">Repeats on day of month</div>
+      <div class="dayscroll">${Array.from({length:31},(_,i)=>i+1).map(d=>
+        `<button class="daybtn ${f.day===d?'on':''}" style="${f.day===d?'background:'+CUR[cur].color:''}"
+          onclick="sf('day',${d})">${d}</button>`).join('')}</div>
+      <div class="groupfoot" style="margin-top:-2px">Next run: <b>${nd.toLocaleDateString('en',{weekday:'short',day:'numeric',month:'long'})}</b>
+        · ${f.day>28?'Months without day '+f.day+' use their last day.':'Repeats every month.'}</div>
+
+      <div class="grouphead">Account</div>
+      <div class="card">${active().map(x=>`
+        <div class="row" onclick="sf('acct','${x.id}')">
+          <span class="ic" style="background:${x.color}26;color:${x.color};border-radius:11px">${KINDS[x.kind].i}</span>
+          <div class="mid"><b>${x.name}</b><span>${x.currency} · ${fmt(balance(x.id),x.currency)}</span></div>
+          <span style="color:${f.acct===x.id?CUR[x.currency].color:'var(--txt4)'};font-size:21px">${f.acct===x.id?'◉':'○'}</span>
+        </div>`).join('')}</div>
+
+      <div class="grouphead">Category</div>
+      <div class="card pad"><div class="cats">${CATS.filter(x=>!x.system&&(x.flow==='both'||(x.flow==='expense'&&f.dir==='debit')||(x.flow==='income'&&f.dir==='credit')))
+        .map(x=>`<button class="cat ${f.cat===x.id?'on':''}" onclick="sf('cat','${x.id}')">
+          <span class="ic" style="background:${x.color}${f.cat===x.id?'':'26'};color:${f.cat===x.id?'#fff':x.color}">${x.icon}</span>
+          <span>${x.name}</span></button>`).join('')}</div></div>
+
+      <div class="group" style="margin-top:14px"><div class="field"><label style="flex:1">Active</label>
+        <div class="toggle ${f.active?'on':''}" onclick="sf('active',${!f.active})"><i></i></div></div></div>
+      <div class="groupfoot">${f.active
+        ? 'Posts automatically each month. Missed months are caught up when you next open the app.'
+        : 'Paused — nothing will post until you switch this back on.'}</div>
+
+      ${isEdit?`<button class="btn plain wide" style="margin-top:22px" onclick="delRec('${f.id}')">Delete Recurring Item</button>`:''}
+      <div style="height:24px"></div>`;
+  }
+
+  else if(k==='newAcct'||k==='editAcct'){
+    const c=CUR[f.currency];
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button>
+      <span class="t">${k==='editAcct'?'Edit':'New'} Account</span>
+      <button class="pri" onclick="saveAcct()">Save</button>`;
+    const sw=['#2E5BFF','#00A88E','#C0392B','#AF52DE','#FF9500','#0B7285','#1E8E3E','#E8590C'];
+    body.innerHTML=`
+      <div class="grouphead">Currency</div>
+      <div class="seg">${['INR','MVR'].map(x=>
+        `<button class="${f.currency===x?'on':''}" ${f.locked?'disabled':''}
+          onclick="${f.locked?'':`sf('currency','${x}')`}">${CUR[x].flag} ${x}</button>`).join('')}</div>
+      ${f.locked?`<div class="note" style="margin-top:10px">🔒 Currency is locked — this account already has transactions. Changing it would corrupt both totals.</div>`
+        :`<div class="groupfoot">An account's currency can't change once it has activity.</div>`}
+
+      <div class="grouphead">Details</div>
+      <div class="group">
+        <div class="field"><input placeholder="Account name" value="${f.name||''}" style="text-align:left"
+          oninput="sheetState.form.name=this.value;sheetState.form.errs={}"></div>
+        <div class="field"><input placeholder="Bank / provider (optional)" value="${f.inst||''}" style="text-align:left"
+          oninput="sheetState.form.inst=this.value"></div>
+        <div class="field"><label>Type</label><select onchange="sf('kind',this.value)">
+          ${Object.entries(KINDS).map(([k2,v])=>`<option value="${k2}" ${f.kind===k2?'selected':''}>${v.i} ${v.l}</option>`).join('')}</select></div>
+        <div class="field"><label>Last 4 digits</label><input inputmode="numeric" placeholder="optional" value="${f.mask||''}"
+          oninput="sheetState.form.mask=this.value.replace(/\\D/g,'').slice(0,4)"></div>
+      </div>
+      ${f.errs.name?`<div class="err">⚠ ${f.errs.name}</div>`:''}
+
+      <div class="grouphead">Opening balance</div>
+      <div class="group"><div class="field"><label>${c.sym}</label>
+        <input inputmode="decimal" placeholder="0.00" value="${f.opening||''}"
+          oninput="sheetState.form.opening=this.value;sheetState.form.errs={}"></div></div>
+      ${f.errs.opening?`<div class="err">⚠ ${f.errs.opening}</div>`:''}
+
+      <div class="grouphead">Appearance</div>
+      <div class="card pad" style="display:flex;gap:14px;flex-wrap:wrap;justify-content:center">
+        ${sw.map(h=>`<div onclick="sf('color','${h}')" style="width:34px;height:34px;border-radius:50%;background:${h};cursor:pointer;
+          box-shadow:${f.color===h?'0 0 0 3px var(--card),0 0 0 5.5px '+h:'none'};transform:scale(${f.color===h?1.06:1});transition:all .2s"></div>`).join('')}</div>
+      <div class="group" style="margin-top:10px"><div class="field"><label style="flex:1">Include in ${f.currency} total</label>
+        <div class="toggle ${f.include?'on':''}" onclick="sf('include',${!f.include})"><i></i></div></div></div>
+      <div style="height:24px"></div>`;
+  }
+
+  else if(k==='rate'){
+    const rr=parseRate(f.raw),pinned=S.rates.find(r=>r.base===f.base&&r.quote===f.quote);
+    head.innerHTML=`<button onclick="closeSheet()">Close</button><span class="t">Exchange Rate</span><span style="min-width:58px"></span>`;
+    body.innerHTML=`
+      <div style="display:flex;gap:16px;align-items:center;justify-content:center;margin:14px 0 20px">
+        <span class="badge ${CUR[f.base].cls}" style="font-size:14px;padding:9px 16px">${CUR[f.base].flag} ${f.base}</span>
+        <button style="background:none;border:none;font-size:24px;color:var(--txt3);cursor:pointer;font-family:inherit" onclick="swapRate()">⇄</button>
+        <span class="badge ${CUR[f.quote].cls}" style="font-size:14px;padding:9px 16px">${CUR[f.quote].flag} ${f.quote}</span></div>
+      <div class="card big pad" style="text-align:center">
+        <div style="font-size:14px;color:var(--txt3);margin-bottom:8px">1 ${f.base} equals</div>
+        <div style="display:flex;align-items:baseline;justify-content:center;gap:9px">
+          <input inputmode="decimal" placeholder="0.00" value="${f.raw}" style="border:none;background:none;font-size:38px;
+            font-weight:700;text-align:center;width:58%;outline:none;font-family:inherit;color:var(--txt);letter-spacing:-1.2px;
+            font-variant-numeric:tabular-nums"
+            oninput="sheetState.form.raw=this.value;sheetState.form.errs={};renderSheet()">
+          <span style="font-size:20px;font-weight:600;color:var(--txt3)">${f.quote}</span></div></div>
+      ${f.errs.rate?`<div class="err" style="justify-content:center">⚠ ${f.errs.rate}</div>`
+        :(f.raw&&rr.err?`<div class="err" style="justify-content:center">⚠ ${rr.err}</div>`:'')}
+      ${pinned?`<div style="text-align:center;font-size:13.5px;color:var(--txt3);margin-top:14px">Current: 1 ${f.base} = ${pinned.rate} ${f.quote}</div>`:''}
+      <div class="note" style="margin-top:18px">🔒 Pinned rates only annotate individual transactions. Your INR and MVR totals are never converted or combined.</div>
+      <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+        ${['0','-2','abc','5.42'].map(v=>`<button class="chip" style="background:var(--fill);color:var(--txt)"
+          onclick="sheetState.form.raw='${v}';sheetState.form.errs={};renderSheet()">try "${v}"</button>`).join('')}</div>
+      <button class="btn wide" style="margin-top:20px" onclick="saveRate()">Pin Rate</button>
+      <div style="height:20px"></div>`;
+  }
+
+  else if(k==='newBudget'||k==='editBudget'){
+    const isEdit=k==='editBudget';
+    const cur=f.cur, c=CUR[cur];
+    const chosen=cat(f.cat);
+    const opt=CATS.filter(x=>x.flow!=='income'&&!x.system&&(x.id===f.cat||!budgetOf(x.id,cur)));
+    const spent=catSpent(f.cat,cur,new Date());
+    const n=parseFloat(String(f.raw).replace(/,/g,''));
+    const lim=isNaN(n)?0:Math.round(n*100);
+    const after=(()=>{ if(!(lim>0)) return null;
+      const lvl=budLevel(spent,lim);
+      return {lvl,pct:Math.min(spent/lim,1)*100};})();
+
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button>
+      <span class="t">${isEdit?'Edit':'New'} Limit</span>
+      <button class="pri" onclick="saveBudget()">Save</button>`;
+
+    body.innerHTML=`
+      <div style="text-align:center;padding:6px 0 16px">
+        <span class="ic" style="width:54px;height:54px;border-radius:50%;display:inline-flex;align-items:center;
+          justify-content:center;font-size:24px;background:${chosen.color}26;color:${chosen.color}">${chosen.icon}</span>
+        <div style="font-size:13px;color:var(--txt3);margin-top:9px">Monthly limit for <b style="color:var(--txt)">${chosen.name}</b> in ${cur}</div>
+      </div>
+
+      <div class="amountbox"><div class="amountrow"><span class="sym">${c.sym}</span>
+        <input id="budAmt" inputmode="decimal" placeholder="0.00" value="${esc(f.raw)}" autofocus
+          oninput="sheetState.form.raw=this.value;sheetState.form.errs={};renderSheet()"></div></div>
+      ${f.errs.limit?`<div class="err">⚠ ${f.errs.limit}</div>`:''}
+      ${after?`<div class="budprev" style="margin:12px 16px 0">
+          <span class="track" style="max-width:130px"><i style="width:${after.pct}%;background:${after.lvl==='over'?'var(--red)':after.lvl==='near'?'var(--orange)':c.color}"></i></span>
+          <span>${fmt(spent,cur)} spent already this month</span></div>
+        ${after.lvl!=='ok'?`<div class="note warn" style="margin-top:10px">⚠ You've already ${after.lvl==='over'?'gone over':'reached 80% of'} this limit this month. The alert is showing in your inbox.</div>`:''}`
+        :''}
+
+      <div class="grouphead">Category</div>
+      <div class="card pad"><div class="cats">${opt.map(x=>`
+        <button class="cat ${f.cat===x.id?'on':''}" onclick="sheetState.form.cat='${x.id}';sheetState.form.errs={};renderSheet()">
+          <span class="ic" style="background:${x.color}${f.cat===x.id?'':'26'};color:${f.cat===x.id?'#fff':x.color}">${x.icon}</span>
+          <span>${x.name}</span></button>`).join('')}</div></div>
+
+      ${!isEdit?`<div class="grouphead">Currency</div>
+        <div class="seg">${['MVR','INR'].map(x=>
+          `<button class="${cur===x?'on':''}" onclick="sheetState.form.cur='${x}';sheetState.form.errs={};renderSheet()">${CUR[x].flag} ${x}</button>`).join('')}</div>
+        <div class="groupfoot">A limit applies to one currency only, matching how your balances are kept.</div>`:''}
+
+      <div class="note blue" style="margin-top:18px">ⓘ You'll get a notification once at 80% and again at 100% of this limit — then it stays quiet until next month.</div>
+      ${isEdit?`<button class="btn plain wide" style="margin-top:16px" onclick="delBudget('${f.id}')">Remove limit</button>`:''}
+      <div style="height:24px"></div>`;
+  }
+
+  else if(k==='delAcct'){
+    const a=acct(sheetState.data.id),n=S.txns.filter(t=>t.accountId===a.id).length;
+    const targets=active().filter(x=>x.id!==a.id&&x.currency===a.currency);
+    head.innerHTML=`<button onclick="closeSheet()">Cancel</button><span class="t">Delete Account</span><span style="min-width:58px"></span>`;
+    body.innerHTML=`
+      <div style="text-align:center;padding:12px 0 20px">
+        <div style="font-size:48px">🗑️</div>
+        <h3 style="margin:10px 0 7px;font-size:19px;letter-spacing:-.4px">Delete ${a.name}?</h3>
+        <p style="margin:0;font-size:15px;color:var(--txt3);line-height:1.4">${n===0?'This account has no transactions.'
+          :`This account has ${n} transaction${n===1?'':'s'}. Choose what happens to them.`}</p></div>
+      ${n>0?`
+        <div class="seg">${['Delete all','Move','Archive'].map((l,i)=>
+          `<button class="${f.choice===i?'on':''}" onclick="sf('choice',${i})">${l}</button>`).join('')}</div>
+        <div class="note ${f.choice===0?'warn':''}" style="margin-top:14px">
+          ${f.choice===0?`⚠ The account and its ${n} transactions are permanently removed.`
+            :f.choice===1?(targets.length?'↗ Transactions move to another account. Only same-currency targets are offered.'
+              :`✕ No other ${a.currency} account to move them to. Transactions can only move within the same currency.`)
+            :'📦 History is kept but hidden, and the balance leaves your '+a.currency+' total.'}</div>
+        ${f.choice===1&&targets.length?`<div class="card" style="margin-top:12px">${targets.map(x=>`
+          <div class="row" onclick="sf('target','${x.id}')">
+            <span class="ic" style="background:${x.color}26;color:${x.color};border-radius:11px">${KINDS[x.kind].i}</span>
+            <div class="mid"><b>${x.name}</b><span>${x.currency} · ${KINDS[x.kind].l}</span></div>
+            <span style="color:${f.target===x.id?CUR[x.currency].color:'var(--txt4)'};font-size:21px">${f.target===x.id?'◉':'○'}</span>
+          </div>`).join('')}</div>`:''}
+      `:''}
+      ${f.errs.del?`<div class="err" style="margin-top:14px">⚠ ${f.errs.del}</div>`:''}
+      <button class="btn danger wide" style="margin-top:22px"
+        ${(n>0&&f.choice===1&&(!targets.length||!f.target))?'disabled':''}
+        onclick="doDelete()">${n>0&&f.choice===2?'Archive Account':'Delete Account'}</button>
+      <div style="height:20px"></div>`;
+  }
+}
+function sf(k,v){sheetState.form[k]=v;renderSheet()}
+function softTxn(){
+  const f=sheetState.form;
+  const p=parseAmount(f.amount,acct(f.acct).currency);
+  const hasWarn=!!document.querySelector('.sbody .note.warn');
+  const shouldWarn=f.dir==='debit'&&p.minor&&balance(f.acct)>=0&&p.minor>balance(f.acct);
+  if(!!shouldWarn!==hasWarn){
+    renderSheet();
+    setTimeout(()=>{const i=document.getElementById('txAmt');
+      if(i){i.focus();i.setSelectionRange(i.value.length,i.value.length)}},0);
+  }
+}
+function swapRate(){const f=sheetState.form;[f.base,f.quote]=[f.quote,f.base];f.errs={};renderSheet()}
+
+/* ===== Transfer handlers ===== */
+function ratePresets(base,quote){
+  const p=S.rates.find(r=>r.base===base&&r.quote===quote);
+  const inv=S.rates.find(r=>r.base===quote&&r.quote===base);
+  const opts=[];
+  if(p) opts.push(['Pinned',p.rate]);
+  if(!p&&inv) opts.push(['Pinned (inverted)',+(1/inv.rate).toFixed(6)]);
+  if(!opts.length) return '';
+  return `<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">${opts.map(([l,v])=>
+    `<button class="chip" style="background:var(--fill);color:var(--txt)"
+      onclick="sheetState.form.rate='${v}';sheetState.form.errs={};renderSheet()">${l}: ${v}</button>`).join('')}</div>`;
+}
+function pickTransfer(side,id){
+  const f=sheetState.form;
+  if(side==='from'&&id===f.to){ f.to=f.from; }      // picking the destination as source swaps them
+  f[side]=id; f.errs={};
+  const from=acct(f.from),to=acct(f.to);
+  if(from&&to&&from.currency!==to.currency&&!f.rate){
+    const p=S.rates.find(r=>r.base===from.currency&&r.quote===to.currency);
+    const inv=S.rates.find(r=>r.base===to.currency&&r.quote===from.currency);
+    f.rate=p?String(p.rate):(inv?String(+(1/inv.rate).toFixed(6)):'');
+  }
+  renderSheet();
+}
+function swapTransfer(){
+  const f=sheetState.form;
+  const from=acct(f.from),to=acct(f.to);
+  [f.from,f.to]=[f.to,f.from];
+  // Invert the rate so the transfer keeps its real-world meaning after a swap.
+  if(from&&to&&from.currency!==to.currency){
+    const rr=parseRate(f.rate);
+    if(rr.rate) f.rate=String(+(1/rr.rate).toFixed(6));
+  }
+  f.errs={}; renderSheet();
+}
+function softTransfer(){
+  const f=sheetState.form;
+  const pv=transferPreview(f.from,f.to,f.amount,f.rate);
+  const from=acct(f.from),to=acct(f.to);
+  const sides=document.querySelectorAll('.tvis .side .am');
+  if(sides[0]) sides[0].textContent=pv.out?'−'+fmt(pv.out.minor,pv.out.cur):fmt(0,from.currency);
+  if(sides[1]) sides[1].textContent=pv.inn?'+'+fmt(pv.inn.minor,pv.inn.cur):fmt(0,to.currency);
+  const hasWarn=!!document.querySelector('.sbody .note.warn');
+  if(!!pv.over!==hasWarn){
+    renderSheet();
+    setTimeout(()=>{const i=document.getElementById('tfAmt');
+      if(i){i.focus();i.setSelectionRange(i.value.length,i.value.length)}},0);
+  }
+}
+function saveTransfer__inner(){
+  const f=sheetState.form;
+  const res=commitTransfer(f.from,f.to,f.amount,f.rate,f.note);
+  if(res.errs){ f.errs=res.errs; renderSheet(); return; }
+  const from=acct(f.from),to=acct(f.to);
+  toast(S.offline?'info':'ok', S.offline
+    ? 'Transfer saved offline — syncs later'
+    : (res.cross
+        ? `${fmt(res.out.minor,res.out.cur)} → ${fmt(res.inn.minor,res.inn.cur)}`
+        : `${fmt(res.out.minor,res.out.cur)} · ${from.name} → ${to.name}`));
+  closeSheet(); render();
+}
+
+/* ===== Recurring handlers ===== */
+function saveRec__inner(){
+  const f=sheetState.form,a=acct(f.acct);
+  f.errs={};
+  if(!(f.name||'').trim()) f.errs.name='Give this a name';
+  const p=parseAmount(f.amount,a?a.currency:'MVR');
+  if(p.err) f.errs.amount=p.err;
+  if(!a) f.errs.amount='Pick an account';
+  if(Object.values(f.errs).some(Boolean)){ renderSheet(); return; }
+
+  if(f.id){
+    const r=S.recurring.find(x=>x.id===f.id);
+    const wasInactive=!r.active;
+    Object.assign(r,{name:f.name.trim(),accountId:a.id,currency:a.currency,amount:p.minor,
+      dir:f.dir,categoryId:f.cat,day:f.day,active:f.active});
+    // Re-activating shouldn't back-post every month it was paused.
+    if(wasInactive&&f.active) r.lastRun=lastDueKey(r);
+    enqueue('recurring','update'); toast('ok','Recurring updated');
+  } else {
+    const r={id:uid(),name:f.name.trim(),accountId:a.id,currency:a.currency,amount:p.minor,
+      dir:f.dir,categoryId:f.cat,day:f.day,active:f.active,lastRun:null,created:new Date().toISOString()};
+    // Start from the next occurrence — creating a rule never back-posts history.
+    r.lastRun=lastDueKey(r);
+    S.recurring.push(r);
+    enqueue('recurring','create');
+    toast('ok',`${r.name} · next ${nextDue(r).toLocaleDateString('en',{day:'numeric',month:'short'})}`);
+  }
+  closeSheet(); render();
+}
+function delRec__inner(id){
+  const r=S.recurring.find(x=>x.id===id),i=S.recurring.indexOf(r);
+  S.recurring.splice(i,1); enqueue('recurring','delete');
+  closeSheet(); render();
+  toast('info','Recurring item deleted',()=>{withSync(()=>{S.recurring.splice(i,0,r)});render()});
+}
+function toggleRec__inner(id,ev){
+  if(ev) ev.stopPropagation();
+  const r=S.recurring.find(x=>x.id===id);
+  r.active=!r.active;
+  if(r.active) r.lastRun=lastDueKey(r);   // resume without back-posting
+  enqueue('recurring','update');
+  render();
+  toast('ok',r.name+(r.active?' resumed':' paused'));
+}
+function runRecurringNow__inner(){
+  const n=runRecurring();
+  render();
+  toast(n?'ok':'info', n?`Posted ${n} scheduled item${n>1?'s':''}`:'Nothing due right now');
+  checkBudgets();   // a posted bill can push a category over its cap
+}
+
+function saveTxn__inner(){
+  const f=sheetState.form,a=acct(f.acct);
+  if(!a){f.errs.amount='Pick an account';renderSheet();return}
+  const p=parseAmount(f.amount,a.currency);
+  f.errs={};
+  if(p.err) f.errs.amount=p.err;
+  if(!f.cat) f.errs.cat='Pick a category';
+  let fx=null;
+  if(f.fx){
+    const rr=parseRate(f.rate);
+    if(rr.err){renderSheet();return}
+    if(rr.rate&&p.minor) fx={base:a.currency,quote:a.currency==='INR'?'MVR':'INR',rate:rr.rate,converted:Math.round(p.minor*rr.rate)};
+  }
+  if(Object.values(f.errs).some(Boolean)){renderSheet();return}
+
+  const note=(f.note||'').trim()||null;
+  if(f.id){
+    const t=S.txns.find(x=>x.id===f.id);
+    Object.assign(t,{accountId:a.id,currency:a.currency,amount:p.minor,dir:f.dir,categoryId:f.cat,
+      merchant:f.merchant||null,note,fx,sync:S.offline?'pendingUpdate':'synced'});
+    enqueue('transaction','update');toast('ok','Updated');
+  } else {
+    S.txns.unshift({id:uid(),accountId:a.id,currency:a.currency,amount:p.minor,dir:f.dir,categoryId:f.cat,
+      merchant:f.merchant||null,note,at:new Date().toISOString(),sync:S.offline?'pendingCreate':'synced',fx});
+    enqueue('transaction','create');
+    toast(S.offline?'info':'ok',
+      S.offline?'Saved offline — will sync later':`${fmt(p.minor,a.currency)} · ${a.name} → ${fmt(balance(a.id),a.currency)}`);
+  }
+  S.txns.sort((x,y)=>new Date(y.at)-new Date(x.at));
+  closeSheet();render();
+  // Crossing a category limit is announced right here, once, with the OS
+  // notification and an inbox entry — see checkBudgets().
+  checkBudgets();
+}
+
+function saveAcct__inner(){
+  const f=sheetState.form;f.errs={};
+  if(!(f.name||'').trim()) f.errs.name='Give the account a name';
+  let open=0;
+  if((f.opening||'').trim()){
+    const n=parseFloat(f.opening.replace(/,/g,''));
+    if(isNaN(n)) f.errs.opening=`"${f.opening}" isn't a valid amount`;
+    else open=Math.round(n*100);
+  }
+  if(Object.values(f.errs).some(Boolean)){renderSheet();return}
+
+  if(f.id){
+    const a=acct(f.id);
+    Object.assign(a,{name:f.name.trim(),inst:f.inst||null,kind:f.kind,opening:open,mask:f.mask||null,color:f.color,include:f.include});
+    if(!f.locked) a.currency=f.currency;
+    enqueue('account','update');toast('ok','Saved');
+  } else {
+    S.accounts.push({id:uid(),name:f.name.trim(),inst:f.inst||null,kind:f.kind,currency:f.currency,
+      opening:open,mask:f.mask||null,color:f.color,include:f.include,archived:false});
+    enqueue('account','create');toast('ok',f.name.trim()+' added');
+  }
+  closeSheet();render();
+}
+
+function saveBudget__inner(){
+  const f=sheetState.form;f.errs={};
+  const n=parseFloat(String(f.raw).replace(/,/g,''));
+  if(isNaN(n)||n<=0) f.errs.limit='Enter a monthly limit above zero';
+  else if(n>1e9) f.errs.limit='That limit is too large';
+  if(!f.cat) f.errs.limit=f.errs.limit||'Pick a category';
+  if(Object.values(f.errs).some(Boolean)){renderSheet();return}
+
+  const limit=Math.round(n*100);
+  S.budgets=S.budgets||[];
+  const clash=S.budgets.find(b=>b.categoryId===f.cat&&b.currency===f.cur&&b.id!==f.id);
+  const rec=clash||(f.id?S.budgets.find(b=>b.id===f.id):null);
+
+  if(rec){
+    Object.assign(rec,{categoryId:f.cat,currency:f.cur,limit,updatedAt:new Date().toISOString()});
+    // Re-baseline so a raised limit can warn again, a lowered one can trip now.
+    rec.lastLevel=budLevel(catSpent(f.cat,f.cur,new Date()),limit);
+    rec.notifiedMonth=null; rec.notifiedLevel=null;
+    toast('ok',`${cat(f.cat).name} limit: ${fmt(limit,f.cur)}/month`);
+  } else {
+    S.budgets.push({id:uid(),categoryId:f.cat,currency:f.cur,limit,
+      lastLevel:'ok',notifiedMonth:null,notifiedLevel:null,createdAt:new Date().toISOString()});
+    toast('ok',`${cat(f.cat).name} capped at ${fmt(limit,f.cur)}/month`);
+  }
+  closeSheet();render();
+  checkBudgets();   // an already-breached limit should surface immediately
+}
+
+function delBudget__inner(id){
+  const b=(S.budgets||[]).find(x=>x.id===id);
+  S.budgets=(S.budgets||[]).filter(x=>x.id!==id);
+  closeSheet();render();
+  if(b) toast('info',`${cat(b.categoryId).name} limit removed`);
+}
+
+function saveRate__inner(){
+  const f=sheetState.form,rr=parseRate(f.raw);
+  if(rr.err){f.errs.rate=rr.err;renderSheet();return}
+  if(!rr.rate){f.errs.rate='Exchange rate must be greater than zero';renderSheet();return}
+  S.rates=S.rates.filter(r=>!(r.base===f.base&&r.quote===f.quote));
+  S.rates.push({base:f.base,quote:f.quote,rate:rr.rate,pinned:true,at:new Date().toISOString()});
+  enqueue('exchangeRate','create');
+  toast('ok',`Rate pinned: 1 ${f.base} = ${rr.rate} ${f.quote}`);
+  closeSheet();render();
+}
+
+function doDelete__inner(){
+  const f=sheetState.form,id=sheetState.data.id,a=acct(id);
+  const n=S.txns.filter(t=>t.accountId===id).length;
+  if(n>0&&f.choice===1){
+    const t=acct(f.target);
+    if(!t){f.errs.del='Pick an account';renderSheet();return}
+    if(t.currency!==a.currency){f.errs.del=`A ${a.currency} transaction can't move to a ${t.currency} account`;renderSheet();return}
+    S.txns.forEach(x=>{if(x.accountId===id)x.accountId=f.target});
+    S.accounts=S.accounts.filter(x=>x.id!==id);
+  } else if(n>0&&f.choice===2){
+    a.archived=true;a.include=false;
+  } else {
+    S.txns=S.txns.filter(x=>x.accountId!==id);
+    S.accounts=S.accounts.filter(x=>x.id!==id);
+  }
+  enqueue('account','delete');
+  toast('ok',a.name+(n>0&&f.choice===2?' archived':' removed'));
+  closeSheet();
+  if(S.ui.stack.length&&S.ui.stack[S.ui.stack.length-1].route==='acct') pop(); else render();
+}
+
+/* ============ APPEARANCE ============ */
+function setAppearance(p){
+  if(window.__theme.pref===p) return;
+  window.__theme.set(p);
+  render();
+  toast('ok', p==='system'
+    ? 'Appearance: Automatic'
+    : 'Appearance: '+p.charAt(0).toUpperCase()+p.slice(1));
+}
+
+
+/* ============ SYNC BRIDGE ============ */
+/* Local-first: every mutation applies to S immediately, is snapshotted to
+   localStorage, and is emitted as an op. The network is never awaited. */
+
+const Sync = window.FaisaaSync || { deviceId:"offline", deviceName:"Device", online:false, peers:0, peerNames:[], outbox:[], loadLocal:function(){return null;}, saveLocal:function(){}, push:function(){}, flush:function(){}, start:function(){}, setName:function(){} };
+let applyingRemote = false;          // guard: don't echo remote ops back out
+
+function snapshot(){
+  return { accounts:S.accounts, txns:S.txns, recurring:S.recurring,
+           rates:S.rates, settings:S.settings,
+           budgets:S.budgets||[], alerts:S.alerts||[] };
+}
+function saveLocal(){ Sync.saveLocal(snapshot()); }
+
+/* Emit one op + persist. Called by the mutation wrappers below. */
+function emit(entity,id,op,data){
+  saveLocal();
+  if(!applyingRemote) Sync.push(entity,id,op,data);
+}
+const opAccount   = (a,op='update')=>emit('account',a.id,op,op==='delete'?null:a);
+const opTxn       = (t,op='update')=>emit('txn',t.id,op,op==='delete'?null:t);
+const opRecurring = (r,op='update')=>emit('recurring',r.id,op,op==='delete'?null:r);
+const opRate      = (r,op='update')=>emit('rate',r.id,op,op==='delete'?null:r);
+const opSettings  = ()=>{ saveLocal(); if(!applyingRemote) Sync.push('settings','settings','update',S.settings); };
+
+/* ---- Diff-based capture ----
+   Rather than editing 30 call sites, we snapshot before a mutation and emit
+   ops for whatever actually changed. Robust and impossible to forget. */
+function withSync(fn){
+  // Defensive: a partially-restored S must never take the UI down.
+  S.accounts=S.accounts||[]; S.txns=S.txns||[]; S.recurring=S.recurring||[];
+  S.rates=S.rates||[]; S.budgets=S.budgets||[]; S.alerts=S.alerts||[];
+  S.settings=S.settings||{primary:'MVR',hints:false};
+  const before = {
+    accounts:new Map(S.accounts.map(x=>[x.id,JSON.stringify(x)])),
+    txns:new Map(S.txns.map(x=>[x.id,JSON.stringify(x)])),
+    recurring:new Map((S.recurring||[]).map(x=>[x.id,JSON.stringify(x)])),
+    rates:new Map((S.rates||[]).map(x=>[x.id||x.base+x.quote,JSON.stringify(x)])),
+    budgets:new Map((S.budgets||[]).map(x=>[x.id,JSON.stringify(x)])),
+    settings:JSON.stringify(S.settings)
+  };
+  const out = fn();
+  const pairs=[['accounts','account',S.accounts],['txns','txn',S.txns],
+               ['recurring','recurring',S.recurring||[]],['rates','rate',S.rates||[]],
+               ['budgets','budget',S.budgets||[]]];
+  for(const [key,entity,list] of pairs){
+    const seen=new Set();
+    for(const rec of list){
+      const id = rec.id || (rec.base+rec.quote);
+      if(!rec.id) rec.id=id;
+      seen.add(id);
+      const prev=before[key].get(id);
+      if(prev!==JSON.stringify(rec)) emit(entity,id,'update',rec);
+    }
+    for(const id of before[key].keys()) if(!seen.has(id)) emit(entity,id,'delete',null);
+  }
+  if(before.settings!==JSON.stringify(S.settings)) opSettings();
+  saveLocal();
+  return out;
+}
+
+/* ---- Apply inbound ---- */
+function applyRemoteState(remote){
+  applyingRemote = true;
+  S.accounts  = remote.accounts  || [];
+  S.txns      = remote.txns      || [];
+  S.recurring = remote.recurring || [];
+  S.rates     = remote.rates     || [];
+  S.budgets   = remote.budgets   || [];
+  // Alerts are per-device notifications, not shared ledger data. Adopting a
+  // remote snapshot must never clear what this device has already told you.
+  if(!S.alerts) S.alerts=[];
+  if(remote.settings) S.settings = Object.assign({}, S.settings, remote.settings);
+  S.txns.sort((a,b)=>new Date(b.at)-new Date(a.at));
+  applyingRemote = false;
+  saveLocal();
+}
+function applyRemoteOps(ops){
+  applyingRemote = true;
+  const COLL={account:'accounts',txn:'txns',recurring:'recurring',rate:'rates',budget:'budgets'};
+  let touched=0;
+  for(const op of ops){
+    if(op.entity==='settings'){ S.settings=Object.assign({},S.settings,op.data||{}); touched++; continue; }
+    const key=COLL[op.entity]; if(!key) continue;
+    if(!S[key]) S[key]=[];
+    const list=S[key], i=list.findIndex(r=>r.id===op.id);
+    if(op.op==='delete'){ if(i>=0){ list.splice(i,1); touched++; } }
+    else { const rec=Object.assign({},op.data,{id:op.id});
+           if(i<0){ list.push(rec); touched++; } else { list[i]=rec; touched++; } }
+  }
+  if(touched) S.txns.sort((a,b)=>new Date(b.at)-new Date(a.at));
+  applyingRemote = false;
+  saveLocal();
+  return touched;
+}
+
+/* ---- Wire up ---- */
+
+/* Push the complete local ledger to the server (first device, or recovery). */
+function uploadEverything(){
+  const ops=[];
+  const add=(entity,list)=>{ (list||[]).forEach(r=>{
+      const id=r.id||(r.base&&r.quote?r.base+r.quote:null); if(!id) return;
+      if(!r.id) r.id=id;
+      ops.push({entity,id,op:'update',data:r,ts:Date.now(),dev:Sync.deviceId}); }); };
+  add('account',S.accounts); add('txn',S.txns);
+  add('recurring',S.recurring); add('rate',S.rates); add('budget',S.budgets||[]);
+  ops.push({entity:'settings',id:'settings',op:'update',data:S.settings,ts:Date.now(),dev:Sync.deviceId});
+  Sync.outbox.push(...ops);
+  Sync.flush();
+  saveLocal();
+}
+
+/* After adopting server state, re-upload any local records it lacked. */
+function pushMissingToServer(remote){
+  const have=k=>new Set((remote[k]||[]).map(r=>r.id));
+  const pairs=[['accounts','account'],['txns','txn'],['recurring','recurring'],['rates','rate'],['budgets','budget']];
+  const local=Sync.loadLocal();
+  if(!local) return;
+  let n=0;
+  for(const [key,entity] of pairs){
+    const remoteIds=have(key);
+    for(const rec of (local[key]||[])){
+      if(rec.id && !remoteIds.has(rec.id)){
+        S[key]=S[key]||[];
+        if(!S[key].some(x=>x.id===rec.id)) S[key].push(rec);
+        Sync.push(entity,rec.id,'update',rec); n++;
+      }
+    }
+  }
+  if(n){ S.txns.sort((a,b)=>new Date(b.at)-new Date(a.at)); saveLocal(); }
+}
+
+Sync.onchange = (payload, kind)=>{
+  if(kind==='hello'){
+    // The server is authoritative ONLY if it actually holds a usable ledger.
+    // An account-less server state means nobody has uploaded yet (or the data
+    // was reset) — in that case we must never wipe good local data. We upload.
+    const remoteUsable = payload && payload.accounts && payload.accounts.length > 0;
+    const localUsable  = S.accounts && S.accounts.length > 0;
+
+    if(remoteUsable){
+      applyRemoteState(payload);
+      // Anything we hold that the server has never seen still gets pushed up,
+      // so a device that was offline doesn't silently lose its work.
+      pushMissingToServer(payload);
+      render();
+    } else if(localUsable){
+      uploadEverything();     // seed the shared ledger from this device
+    }
+  } else if(kind==='ops'){
+    const mine = payload.filter(o=>o.dev!==Sync.deviceId);
+    if(!mine.length) return;
+    const n = applyRemoteOps(mine);
+    if(n){
+      render();
+      const who = Sync.peerNames[0] ? ' from '+Sync.peerNames[0] : '';
+      toast('info','Updated'+who);
+    }
+  }
+};
+Sync.onstatus = ()=>{ paintSyncPill(); };
+
+function paintSyncPill(){
+  const el=document.getElementById('syncPill');
+  if(!el || !window.FaisaaSync) return;
+  const on=Sync.online, q=Sync.outbox.length;
+  el.className='syncpill '+(on?(Sync.peers?'live':'ok'):'off');
+  el.innerHTML = on
+    ? (Sync.peers
+        ? `<i class="dot"></i>${Sync.peers+1} devices live`
+        : (q?`<i class="dot"></i>Syncing ${q}`:`<i class="dot"></i>Synced`))
+    : `<i class="dot"></i>${q?q+' queued':'Offline'}`;
+  const st=document.getElementById('syncStatusLine');
+  if(st) st.textContent = on
+    ? (Sync.peers?`Live · ${Sync.peers+1} devices connected`:'Connected · waiting for other devices')
+    : (q?`Offline · ${q} change${q>1?'s':''} queued`:'Offline · changes saved on this device');
+}
+
+/* ---- Boot ---- */
+function boot(){
+  const local = Sync.loadLocal();
+  // Always seed first: this guarantees S has its full shape (settings, ui,
+  // queue, offline). Restoring only overwrites the persisted collections.
+  seed();
+  if(local && local.accounts){
+    S.accounts  = local.accounts  || [];
+    S.txns      = local.txns      || [];
+    S.recurring = local.recurring || [];
+    S.rates     = local.rates     || [];
+    S.budgets   = local.budgets   || [];
+    S.alerts    = local.alerts    || [];
+    S.settings  = Object.assign({}, S.settings, local.settings || {});
+    S.txns.sort((a,b)=>new Date(b.at)-new Date(a.at));
+  } else {
+    saveLocal();          // first ever launch on this device — keep the demo data
+    S.ui.freshSeed = true;
+  }
+  withSync(()=>{ runRecurring(); });
+  render();
+  paintSyncPill();
+  Sync.start();
+  // Catch anything that crossed a limit while the app was closed.
+  setTimeout(()=>{ try{ checkBudgets(); render(); }catch(e){ console.warn('[Faisaa] budget check',e); } }, 400);
+  // Coming back from the background counts as a fresh look.
+  document.addEventListener('visibilitychange',()=>{
+    if(!document.hidden){
+      try{ if(checkBudgets()) render(); }catch(_){}
+      try{ if(handleQuickLink()) render(); }catch(_){}
+    }
+  });
+  // A widget tap / Back Tap can launch us with ?quick=… — open entry straight away.
+  setTimeout(()=>{ try{ if(handleQuickLink()) render(); }catch(e){ console.warn('[Faisaa] quick link',e); } }, 120);
+  if(S.ui.autoPosted){
+    const {count,names}=S.ui.autoPosted; S.ui.autoPosted=null;
+    setTimeout(()=>toast('ok', count===1
+      ? `${names[0]} posted automatically`
+      : `${count} scheduled items posted`),700);
+  }
+}
+
+
+/* Sync wrappers: run the original, then emit ops for whatever changed. */
+function saveTxn(...a){ return withSync(()=>saveTxn__inner(...a)); }
+function saveAcct(...a){ return withSync(()=>saveAcct__inner(...a)); }
+function saveRate(...a){ return withSync(()=>saveRate__inner(...a)); }
+function doDelete(...a){ return withSync(()=>doDelete__inner(...a)); }
+function saveTransfer(...a){ return withSync(()=>saveTransfer__inner(...a)); }
+function saveRec(...a){ return withSync(()=>saveRec__inner(...a)); }
+function delRec(...a){ return withSync(()=>delRec__inner(...a)); }
+function toggleRec(...a){ return withSync(()=>toggleRec__inner(...a)); }
+function delTxn(...a){ return withSync(()=>delTxn__inner(...a)); }
+function doSpend(...a){ return withSync(()=>doSpend__inner(...a)); }
+function runRecurringNow(...a){ return withSync(()=>runRecurringNow__inner(...a)); }
+function resetData(...a){ return withSync(()=>resetData__inner(...a)); }
+function wipeAccounts(...a){ return withSync(()=>wipeAccounts__inner(...a)); }
+function saveBudget(...a){ return withSync(()=>saveBudget__inner(...a)); }
+function delBudget(...a){ return withSync(()=>delBudget__inner(...a)); }
+
+/* ============ DEV HARNESS ============ */
+function wipeAccounts__inner(){S.accounts=[];S.txns=[];S.ui.stack=[];toast('info','All accounts deleted — empty state');render()}
+function resetData__inner(){const off=S.offline;seed();S.offline=off;toast('ok','Demo data restored');render()}
+
+document.getElementById('screen').addEventListener('scroll',e=>{
+  document.getElementById('navbar').classList.toggle('scrolled',e.target.scrollTop>4);
+});
+
+/* Escape closes the quick-add menu, then any open sheet. */
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape') return;
+  if(fabOpen) closeFab();
+  else if(document.getElementById('sheet').classList.contains('on')) closeSheet();
+});
+
+try { boot(); } catch(e) {
+  console.error('[Faisaa] boot failed:', e);
+  try { seed(); render(); } catch(e2) {
+    console.error('[Faisaa] fallback render failed:', e2);
+    var scr = document.getElementById('screen');
+    if (scr) scr.innerHTML = '<div style="padding:48px 24px;text-align:center;font-family:-apple-system,system-ui,sans-serif;color:#888"><div style="font-size:40px;margin-bottom:12px">💰</div><h2 style="color:#111;margin:0 0 8px">Faisaa</h2><p>Something went wrong loading. Please reload the page.</p></div>';
+  }
+}
+</script>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a5b39d2f199f119a',t:'MTc5NDgwMTg5MQ=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a5b39d2f199f119a',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
