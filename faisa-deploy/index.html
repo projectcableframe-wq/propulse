@@ -1899,6 +1899,14 @@ function quickLink(opts){
 
 /* Read the deep-link parameters once the app is ready and open the sheet. */
 let _quickHandled=null;
+/* Clear the ?quick=… params once consumed, so the next back-tap isn't blocked
+   by a stale "already handled" URL and the address bar stays clean. */
+function stripQuickParams(){
+  try{
+    if(history.replaceState && (location.search||'').length)
+      history.replaceState(null,'',location.pathname+(location.hash||''));
+  }catch(_){}
+}
 function handleQuickLink(){
   let q='';
   try{ q=(location.search||'').replace(/^\?/,''); }catch(_){}
@@ -1914,10 +1922,11 @@ function handleQuickLink(){
 
   if(!active().length){ openSheet('newAcct'); return true; }
 
-  if(kind==='transfer'){ openSheet('transfer'); return true; }
+  if(kind==='transfer'){ openSheet('transfer'); stripQuickParams(); return true; }
   if(kind==='budget'){
     const c=S.ui.budgetCur||S.settings.primary||'MVR';
     openSheet(params.cat?'editBudget':'newBudget', params.cat?{id:(budgetOf(params.cat,c)||{}).id}:{cat:params.cat,cur:c});
+    stripQuickParams();
     return true;
   }
   const dir=kind==='income'?'credit':'debit';
@@ -1938,6 +1947,7 @@ function handleQuickLink(){
     sheetState.form.amount=params.amount;
     renderSheet();
   }
+  stripQuickParams();
   return true;
 }
 try{
